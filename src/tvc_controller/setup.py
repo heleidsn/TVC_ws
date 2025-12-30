@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'lqr_px4_controller = tvc_controller.lqr_controller_node:main',
+            'auto_takeoff_land = tvc_controller.px4_simple_trajectory:main',
         ],
     },
 )
