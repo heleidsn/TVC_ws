@@ -274,6 +274,9 @@ class MatplotlibWidget(QWidget):
             linestyle = linestyles[idx % len(linestyles)]
             time = result.time
             
+            # Check if desired trajectory exists (for PID controller with position input)
+            has_desired = (result.desired_traj is not None and result.controller_name == 'pid')
+            
             for i in range(4):
                 for j in range(3):
                     state_idx = i * 3 + j
@@ -283,17 +286,32 @@ class MatplotlibWidget(QWidget):
                         axes[i, j].plot(time, np.degrees(euler_traj[:, j]), 
                                        color=color, label=name, linestyle=linestyle, linewidth=2)
                         axes[i, j].plot(time, np.degrees(euler_ref[:, j]), 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1)
+                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                        # Plot desired attitude if available
+                        if has_desired:
+                            axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
+                                           color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
                     elif i == 3:  # Angular velocity row - convert from rad/s to deg/s
                         axes[i, j].plot(time, np.degrees(result.state_traj[:, state_idx]), 
                                        color=color, label=name, linestyle=linestyle, linewidth=2)
                         axes[i, j].plot(time, np.degrees(result.state_ref_traj[:, state_idx]), 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1)
+                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                        # Plot desired angular velocity if available
+                        if has_desired:
+                            axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
+                                           color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
                     else:
                         axes[i, j].plot(time, result.state_traj[:, state_idx], 
                                        color=color, label=name, linestyle=linestyle, linewidth=2)
                         axes[i, j].plot(time, result.state_ref_traj[:, state_idx], 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1)
+                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                        # Plot desired values if available (skip position, as it's user-specified)
+                        if has_desired and i > 0:  # Skip position (i=0) as it's user-specified, not controller output
+                            desired_vals = result.desired_traj[:, state_idx]
+                            # Only plot if not all NaN
+                            if not np.all(np.isnan(desired_vals)):
+                                axes[i, j].plot(time, desired_vals, 
+                                               color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
                     axes[i, j].set_title(state_labels[i][j], fontsize=10)
                     axes[i, j].grid(True, alpha=0.3)
                     axes[i, j].set_xlabel('Time (s)', fontsize=9)

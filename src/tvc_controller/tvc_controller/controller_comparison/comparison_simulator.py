@@ -80,6 +80,7 @@ class SimulationResult:
     control_traj: np.ndarray  # (N, 4)
     state_ref_traj: np.ndarray  # (N, 12)
     controller_name: str
+    desired_traj: Optional[np.ndarray] = None  # (N, 12) - desired values from controller layers
 
 
 class ComparisonSimulator:
@@ -138,10 +139,39 @@ class ComparisonSimulator:
         state_traj = np.zeros((n_steps, 12))
         control_traj = np.zeros((n_steps, 4))
         state_ref_traj = np.zeros((n_steps, 12))
+        desired_traj = None  # Will be initialized if needed
+        
+        # Check if we need to record desired values (PID controller with position input)
+        record_desired = (controller_name == 'pid')
+        if record_desired:
+            desired_traj = np.zeros((n_steps, 12))  # [vel_cmd, att_cmd, omega_cmd]
         
         # Initial state
         state = state0.copy()
         state_traj[0] = state
+        
+        # Get initial reference state
+        if callable(state_ref):
+            state_ref_current = state_ref(time[0])
+        else:
+            state_ref_current = state_ref
+        state_ref_traj[0] = state_ref_current
+        
+        # Record initial desired values if needed
+        if record_desired:
+            # Compute control to get initial desired values
+            u, debug_info = controller.compute_control(state, state_ref_current, self.dt, return_debug=True)
+            # Store desired values from controller layers
+            desired_traj[0, 0:3] = np.nan  # Position desired is user-specified, not controller output
+            desired_traj[0, 3:6] = debug_info['vel_cmd']  # Desired velocity from position controller
+            from scipy.spatial.transform import Rotation
+            att_ref_total = debug_info['att_ref_total']
+            qw = np.sqrt(np.clip(1.0 - np.sum(att_ref_total**2), 0.0, 1.0))
+            q = np.array([qw, att_ref_total[0], att_ref_total[1], att_ref_total[2]])
+            rot = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+            euler = rot.as_euler('ZYX', degrees=False)
+            desired_traj[0, 6:9] = np.array([euler[2], euler[1], euler[0]])
+            desired_traj[0, 9:12] = debug_info['omega_ref_total']
         
         # Control constraints
         phi_min, phi_max = -0.2, 0.2  # rad
@@ -160,7 +190,26 @@ class ComparisonSimulator:
             
             # Compute control
             if controller_name == 'pid':
-                u = controller.compute_control(state, state_ref_current, self.dt)
+                if record_desired:
+                    u, debug_info = controller.compute_control(state, state_ref_current, self.dt, return_debug=True)
+                    # Store desired values from controller layers:
+                    # Position: user-specified (not controller output, so no desired to show)
+                    # Velocity: vel_cmd (from position controller P-only output)
+                    # Attitude: att_ref_total (from velocity controller output)
+                    # Angular velocity: omega_ref_total (from attitude controller output)
+                    desired_traj[i, 0:3] = np.nan  # Position desired is user-specified, not controller output
+                    desired_traj[i, 3:6] = debug_info['vel_cmd']  # Desired velocity from position controller
+                    # Convert att_ref_total to Euler for display
+                    from scipy.spatial.transform import Rotation
+                    att_ref_total = debug_info['att_ref_total']
+                    qw = np.sqrt(np.clip(1.0 - np.sum(att_ref_total**2), 0.0, 1.0))
+                    q = np.array([qw, att_ref_total[0], att_ref_total[1], att_ref_total[2]])
+                    rot = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+                    euler = rot.as_euler('ZYX', degrees=False)  # [yaw, pitch, roll]
+                    desired_traj[i, 6:9] = np.array([euler[2], euler[1], euler[0]])  # [roll, pitch, yaw]
+                    desired_traj[i, 9:12] = debug_info['omega_ref_total']  # Desired angular velocity (already in rad/s)
+                else:
+                    u = controller.compute_control(state, state_ref_current, self.dt)
             else:
                 u = controller.compute_control(state, state_ref_current)
             
@@ -182,7 +231,8 @@ class ComparisonSimulator:
             state_traj=state_traj,
             control_traj=control_traj,
             state_ref_traj=state_ref_traj,
-            controller_name=controller_name
+            controller_name=controller_name,
+            desired_traj=desired_traj
         )
     
     def compare_controllers(self, state0: np.ndarray, state_ref: np.ndarray,
