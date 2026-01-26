@@ -11,6 +11,8 @@ Provides a graphical interface for comparing different controllers:
 
 import sys
 import os
+import json
+import signal
 import numpy as np
 
 # Set environment variables for high DPI scaling before importing Qt
@@ -22,7 +24,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QCoreApplication
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QLabel, QGroupBox, QTextEdit,
                              QProgressBar, QMessageBox, QTabWidget, QDoubleSpinBox,
-                             QFormLayout, QScrollArea, QTableWidget, QTableWidgetItem, QFrame)
+                             QFormLayout, QScrollArea, QTableWidget, QTableWidgetItem, QFrame,
+                             QFileDialog, QSizePolicy)
 from PyQt5.QtGui import QFont
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -82,13 +85,14 @@ class AttitudeDebugWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, phy_params, att_init_euler, att_ref_euler, sim_time, dt):
+    def __init__(self, phy_params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains=None):
         super().__init__()
         self.phy_params = phy_params
         self.att_init_euler = att_init_euler
         self.att_ref_euler = att_ref_euler
         self.sim_time = sim_time
         self.dt = dt
+        self.pid_gains = pid_gains  # PID gains dictionary from GUI
         
     def run(self):
         try:
@@ -101,7 +105,25 @@ class AttitudeDebugWorker(QThread):
                 from .rocket_dynamics import RocketDynamics
             
             # Initialize controller and dynamics
-            pid = PIDController(self.phy_params)
+            # Get limits from GUI if available (default values if not)
+            max_deflection_deg = 15.0
+            max_angular_vel_deg_s = 86.0
+            if self.pid_gains is not None and 'max_deflection_angle_deg' in self.pid_gains:
+                max_deflection_deg = self.pid_gains['max_deflection_angle_deg']
+            if self.pid_gains is not None and 'max_angular_velocity_deg_s' in self.pid_gains:
+                max_angular_vel_deg_s = self.pid_gains['max_angular_velocity_deg_s']
+            
+            pid = PIDController(self.phy_params, 
+                               max_deflection_angle_deg=max_deflection_deg,
+                               max_angular_velocity_deg_s=max_angular_vel_deg_s)
+            
+            # Apply PID gains from GUI if provided
+            if self.pid_gains is not None:
+                gains_dict = {k: v for k, v in self.pid_gains.items() 
+                             if k not in ['max_deflection_angle_deg', 'max_angular_velocity_deg_s']}
+                if gains_dict:
+                    pid.set_gains(gains_dict)
+            
             dynamics = RocketDynamics(self.phy_params)
             
             # Convert initial attitude to quaternion
@@ -185,22 +207,40 @@ class MatplotlibWidget(QWidget):
     """Widget for displaying matplotlib figures"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.figure = Figure(figsize=(12, 8), dpi=100)
+        # Use a reasonable default size, but allow it to adapt
+        self.figure = Figure(figsize=(10, 8), dpi=100)
         self.canvas = FigureCanvas(self.figure)
         
         layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
         self.setLayout(layout)
+        
+        # Enable size policy to allow resizing
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
     
     def clear(self):
         """Clear the figure"""
         self.figure.clear()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
+    
+    def resizeEvent(self, event):
+        """Handle resize events to update figure size"""
+        super().resizeEvent(event)
+        if self.canvas:
+            # Update figure size based on widget size
+            width = self.width() / self.figure.dpi
+            height = self.height() / self.figure.dpi
+            if width > 0 and height > 0:
+                self.figure.set_size_inches(width, height)
+                self.canvas.draw_idle()
     
     def plot_states(self, results):
         """Plot state trajectories"""
         self.figure.clear()
-        self.figure.set_size_inches(12, 10)
+        # Remove fixed size, let it adapt to widget size
         axes = self.figure.subplots(4, 3)
         self.figure.suptitle('State Trajectories Comparison', fontsize=14, fontweight='bold')
         
@@ -262,12 +302,14 @@ class MatplotlibWidget(QWidget):
             ax.legend(loc='best', fontsize=8)
         
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
     
     def plot_controls(self, results):
         """Plot control inputs"""
         self.figure.clear()
-        self.figure.set_size_inches(10, 8)
+        # Remove fixed size, let it adapt to widget size
         axes = self.figure.subplots(2, 2)
         self.figure.suptitle('Control Inputs Comparison', fontsize=14, fontweight='bold')
         
@@ -305,12 +347,14 @@ class MatplotlibWidget(QWidget):
             ax.set_xlabel('Time (s)', fontsize=9)
         
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
     
     def plot_errors(self, results):
         """Plot tracking errors"""
         self.figure.clear()
-        self.figure.set_size_inches(12, 10)
+        # Remove fixed size, let it adapt to widget size
         axes = self.figure.subplots(4, 3)
         self.figure.suptitle('Tracking Errors Comparison', fontsize=14, fontweight='bold')
         
@@ -371,29 +415,55 @@ class MatplotlibWidget(QWidget):
             ax.legend(loc='best', fontsize=8)
         
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
     
     def plot_3d_trajectory(self, results):
         """Plot 3D trajectory"""
         self.figure.clear()
+        # Remove fixed size, let it adapt to widget size
         ax = self.figure.add_subplot(111, projection='3d')
         ax.set_title('3D Trajectory Comparison', fontsize=14, fontweight='bold')
         
         colors = ['b', 'r', 'g', 'm', 'c', 'y']
         linestyles = ['-', '-', '-', '-', '-', '-']
         
+        # Track if we've already plotted start and target points (to avoid duplicates in legend)
+        start_plotted = False
+        target_plotted = False
+        
         for idx, (name, result) in enumerate(results.items()):
             color = colors[idx % len(colors)]
             linestyle = linestyles[idx % len(linestyles)]
             
+            # Plot trajectory
             ax.plot(result.state_traj[:, 0], result.state_traj[:, 1], 
                    result.state_traj[:, 2], color=color, label=name, 
                    linestyle=linestyle, linewidth=2, alpha=0.8)
             
-            ax.scatter(result.state_traj[0, 0], result.state_traj[0, 1], 
-                      result.state_traj[0, 2], color=color, s=100, marker='o')
-            ax.scatter(result.state_traj[-1, 0], result.state_traj[-1, 1], 
-                      result.state_traj[-1, 2], color=color, s=100, marker='s')
+            # Plot start point (green circle, larger size)
+            if not start_plotted:
+                ax.scatter(result.state_traj[0, 0], result.state_traj[0, 1], 
+                          result.state_traj[0, 2], color='green', s=200, marker='o', 
+                          edgecolors='darkgreen', linewidths=2, label='起始点 (Start)', zorder=10)
+                start_plotted = True
+            else:
+                ax.scatter(result.state_traj[0, 0], result.state_traj[0, 1], 
+                          result.state_traj[0, 2], color='green', s=200, marker='o', 
+                          edgecolors='darkgreen', linewidths=2, zorder=10)
+            
+            # Plot target point (red star, from reference state)
+            target_pos = result.state_ref_traj[0, 0:3]  # Get target position from reference
+            if not target_plotted:
+                ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
+                          color='red', s=300, marker='*', 
+                          edgecolors='darkred', linewidths=2, label='目标点 (Target)', zorder=10)
+                target_plotted = True
+            else:
+                ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
+                          color='red', s=300, marker='*', 
+                          edgecolors='darkred', linewidths=2, zorder=10)
         
         ax.set_xlabel('X (m)', fontsize=11)
         ax.set_ylabel('Y (m)', fontsize=11)
@@ -402,12 +472,14 @@ class MatplotlibWidget(QWidget):
         ax.grid(True, alpha=0.3)
         
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
     
     def plot_attitude_debug(self, result):
         """Plot attitude control debug results"""
         self.figure.clear()
-        self.figure.set_size_inches(16, 12)
+        # Remove fixed size, let it adapt to widget size
         axes = self.figure.subplots(3, 3)
         self.figure.suptitle(f'PID Attitude Control Response\nReference: Roll={result["att_ref_euler_deg"][0]:.1f}°, '
                              f'Pitch={result["att_ref_euler_deg"][1]:.1f}°, Yaw={result["att_ref_euler_deg"][2]:.1f}°', 
@@ -491,17 +563,35 @@ class MatplotlibWidget(QWidget):
         axes[2, 1].grid(True)
         axes[2, 1].legend()
         
-        # Plot 9: Thrust (control input)
-        axes[2, 2].plot(time_points, control_traj[:, 2], 'g-', label='Thrust', linewidth=2)
-        axes[2, 2].axhline(y=0.6570 * 9.81, color='r', linestyle='--', alpha=0.7, label='Equilibrium')
-        axes[2, 2].set_xlabel('Time (s)')
-        axes[2, 2].set_ylabel('Thrust (N)')
-        axes[2, 2].set_title('Control Input: Thrust')
-        axes[2, 2].grid(True)
-        axes[2, 2].legend()
+        # Plot 9: Thrust and Yaw Torque (control input) - dual y-axis
+        ax_thrust = axes[2, 2]
+        ax_torque = ax_thrust.twinx()  # Create second y-axis
+        
+        # Plot thrust on left y-axis
+        line1 = ax_thrust.plot(time_points, control_traj[:, 2], 'g-', label='Thrust', linewidth=2)
+        ax_thrust.axhline(y=0.6570 * 9.81, color='r', linestyle='--', alpha=0.7, label='Equilibrium')
+        ax_thrust.set_xlabel('Time (s)')
+        ax_thrust.set_ylabel('Thrust (N)', color='g')
+        ax_thrust.tick_params(axis='y', labelcolor='g')
+        ax_thrust.grid(True, alpha=0.3)
+        
+        # Plot yaw torque on right y-axis
+        line2 = ax_torque.plot(time_points, control_traj[:, 3], 'b-', label='Yaw Torque (tau_r)', linewidth=2)
+        ax_torque.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        ax_torque.set_ylabel('Yaw Torque (Nm)', color='b')
+        ax_torque.tick_params(axis='y', labelcolor='b')
+        
+        # Combine legends
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax_thrust.legend(lines, labels, loc='best')
+        
+        ax_thrust.set_title('Control Input: Thrust & Yaw Torque')
         
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.flush_events()
+        self.update()
 
 
 class ControllerComparisonGUI(QMainWindow):
@@ -514,8 +604,14 @@ class ControllerComparisonGUI(QMainWindow):
         self.worker = None
         self.att_debug_worker = None
         
+        # Default parameter file path (in the same directory as the script)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.param_file_path = os.path.join(script_dir, 'controller_parameters.json')
+        
         self.init_ui()
         self.init_simulator()
+        # Auto-load parameters after UI and simulator are initialized
+        self.auto_load_parameters()
         
     def init_ui(self):
         """Initialize the user interface"""
@@ -682,20 +778,15 @@ class ControllerComparisonGUI(QMainWindow):
         pid_layout.setSpacing(5)
         pid_layout.setContentsMargins(5, 5, 5, 5)
         
-        # Position PID gains - compact layout (Kp, Ki, Kd in one row per axis)
-        pos_label = QLabel("<b>Position PID Gains:</b>")
+        # Position control gains - only P term (all in one row)
+        pos_label = QLabel("<b>Position Control Gains (P only):</b>")
         pid_layout.addWidget(pos_label)
         self.pid_Kp_pos = {}
-        self.pid_Ki_pos = {}
-        self.pid_Kd_pos = {}
         pos_names = ['X', 'Y', 'Z']
         default_Kp_pos = [1.0, 1.0, 10.0]
-        default_Ki_pos = [0.0, 0.0, 0.0]
-        default_Kd_pos = [0.5, 0.5, 0.5]
+        pos_row_layout = QHBoxLayout()
         for i, name in enumerate(pos_names):
-            row_layout = QHBoxLayout()
-            row_layout.addWidget(QLabel(f"{name}:"))
-            row_layout.addWidget(QLabel("Kp:"))
+            pos_row_layout.addWidget(QLabel(f"{name} Kp:"))
             spin_kp = QDoubleSpinBox()
             spin_kp.setRange(0.0, 100.0)
             spin_kp.setValue(default_Kp_pos[i])
@@ -703,29 +794,9 @@ class ControllerComparisonGUI(QMainWindow):
             spin_kp.setDecimals(1)
             spin_kp.setMaximumWidth(80)
             self.pid_Kp_pos[i] = spin_kp
-            row_layout.addWidget(spin_kp)
-            
-            row_layout.addWidget(QLabel("Ki:"))
-            spin_ki = QDoubleSpinBox()
-            spin_ki.setRange(0.0, 10.0)
-            spin_ki.setValue(default_Ki_pos[i])
-            spin_ki.setSingleStep(0.01)
-            spin_ki.setDecimals(1)
-            spin_ki.setMaximumWidth(80)
-            self.pid_Ki_pos[i] = spin_ki
-            row_layout.addWidget(spin_ki)
-            
-            row_layout.addWidget(QLabel("Kd:"))
-            spin_kd = QDoubleSpinBox()
-            spin_kd.setRange(0.0, 10.0)
-            spin_kd.setValue(default_Kd_pos[i])
-            spin_kd.setSingleStep(0.1)
-            spin_kd.setDecimals(1)
-            spin_kd.setMaximumWidth(80)
-            self.pid_Kd_pos[i] = spin_kd
-            row_layout.addWidget(spin_kd)
-            row_layout.addStretch()
-            pid_layout.addLayout(row_layout)
+            pos_row_layout.addWidget(spin_kp)
+        pos_row_layout.addStretch()
+        pid_layout.addLayout(pos_row_layout)
         
         # Velocity PID gains - compact layout
         vel_label = QLabel("<b>Velocity PID Gains:</b>")
@@ -772,20 +843,15 @@ class ControllerComparisonGUI(QMainWindow):
             row_layout.addStretch()
             pid_layout.addLayout(row_layout)
         
-        # Attitude PID gains - compact layout
-        att_label = QLabel("<b>Attitude PID Gains:</b>")
+        # Attitude control gains - only P term (all in one row)
+        att_label = QLabel("<b>Attitude Control Gains (P only):</b>")
         pid_layout.addWidget(att_label)
         self.pid_Kp_att = {}
-        self.pid_Ki_att = {}
-        self.pid_Kd_att = {}
         att_names = ['Qx', 'Qy', 'Qz']
-        default_Kp_att = [2.0, 2.0, 0.5]
-        default_Ki_att = [0.0, 0.0, 0.0]
-        default_Kd_att = [0.5, 0.5, 0.1]
+        default_Kp_att = [5.0, 5.0, 1.0]
+        att_row_layout = QHBoxLayout()
         for i, name in enumerate(att_names):
-            row_layout = QHBoxLayout()
-            row_layout.addWidget(QLabel(f"{name}:"))
-            row_layout.addWidget(QLabel("Kp:"))
+            att_row_layout.addWidget(QLabel(f"{name} Kp:"))
             spin_kp = QDoubleSpinBox()
             spin_kp.setRange(0.0, 100.0)
             spin_kp.setValue(default_Kp_att[i])
@@ -793,29 +859,9 @@ class ControllerComparisonGUI(QMainWindow):
             spin_kp.setDecimals(1)
             spin_kp.setMaximumWidth(80)
             self.pid_Kp_att[i] = spin_kp
-            row_layout.addWidget(spin_kp)
-            
-            row_layout.addWidget(QLabel("Ki:"))
-            spin_ki = QDoubleSpinBox()
-            spin_ki.setRange(0.0, 10.0)
-            spin_ki.setValue(default_Ki_att[i])
-            spin_ki.setSingleStep(0.01)
-            spin_ki.setDecimals(1)
-            spin_ki.setMaximumWidth(80)
-            self.pid_Ki_att[i] = spin_ki
-            row_layout.addWidget(spin_ki)
-            
-            row_layout.addWidget(QLabel("Kd:"))
-            spin_kd = QDoubleSpinBox()
-            spin_kd.setRange(0.0, 10.0)
-            spin_kd.setValue(default_Kd_att[i])
-            spin_kd.setSingleStep(0.1)
-            spin_kd.setDecimals(1)
-            spin_kd.setMaximumWidth(80)
-            self.pid_Kd_att[i] = spin_kd
-            row_layout.addWidget(spin_kd)
-            row_layout.addStretch()
-            pid_layout.addLayout(row_layout)
+            att_row_layout.addWidget(spin_kp)
+        att_row_layout.addStretch()
+        pid_layout.addLayout(att_row_layout)
         
         # Angular velocity PID gains - compact layout
         omega_label = QLabel("<b>Angular Velocity PID Gains:</b>")
@@ -861,6 +907,32 @@ class ControllerComparisonGUI(QMainWindow):
             row_layout.addWidget(spin_kd)
             row_layout.addStretch()
             pid_layout.addLayout(row_layout)
+        
+        # Control limits
+        limits_label = QLabel("<b>Control Limits:</b>")
+        pid_layout.addWidget(limits_label)
+        
+        limits_layout = QFormLayout()
+        
+        self.spin_max_deflection_angle = QDoubleSpinBox()
+        self.spin_max_deflection_angle.setRange(1.0, 45.0)
+        self.spin_max_deflection_angle.setValue(15.0)
+        self.spin_max_deflection_angle.setSingleStep(1.0)
+        self.spin_max_deflection_angle.setDecimals(1)
+        self.spin_max_deflection_angle.setSuffix(" deg")
+        limits_layout.addRow("Max Deflection Angle:", self.spin_max_deflection_angle)
+        
+        self.spin_max_angular_velocity = QDoubleSpinBox()
+        self.spin_max_angular_velocity.setRange(10.0, 360.0)
+        self.spin_max_angular_velocity.setValue(86.0)  # ~1.5 rad/s
+        self.spin_max_angular_velocity.setSingleStep(10.0)
+        self.spin_max_angular_velocity.setDecimals(1)
+        self.spin_max_angular_velocity.setSuffix(" deg/s")
+        limits_layout.addRow("Max Angular Velocity:", self.spin_max_angular_velocity)
+        
+        limits_widget = QWidget()
+        limits_widget.setLayout(limits_layout)
+        pid_layout.addWidget(limits_widget)
         
         pid_widget.setLayout(pid_layout)
         pid_scroll.setWidget(pid_widget)
@@ -934,7 +1006,11 @@ class ControllerComparisonGUI(QMainWindow):
         lqr_att_tab_layout.addWidget(lqr_att_scroll)
         self.controller_params_tabs.addTab(lqr_att_tab, "Attitude-Only LQR")
         
-        layout.addWidget(self.controller_params_tabs)
+        # Simulation Parameters tab
+        sim_tab = QWidget()
+        sim_tab_layout = QVBoxLayout()
+        sim_tab_layout.setContentsMargins(10, 10, 10, 10)
+        sim_tab.setLayout(sim_tab_layout)
         
         # Simulation parameters group
         params_group = QGroupBox("Simulation Parameters")
@@ -956,9 +1032,9 @@ class ControllerComparisonGUI(QMainWindow):
         params_layout.addRow("Time Step:", self.spin_dt)
         
         params_group.setLayout(params_layout)
-        layout.addWidget(params_group)
+        sim_tab_layout.addWidget(params_group)
         
-        # Initial state group (compact, one line)
+        # Initial state group
         init_state_group = QGroupBox("Initial State")
         init_layout = QHBoxLayout()
         init_layout.setContentsMargins(10, 5, 10, 5)
@@ -989,9 +1065,9 @@ class ControllerComparisonGUI(QMainWindow):
         
         init_layout.addStretch()
         init_state_group.setLayout(init_layout)
-        layout.addWidget(init_state_group)
+        sim_tab_layout.addWidget(init_state_group)
         
-        # Reference state group (compact, one line)
+        # Reference state group
         ref_state_group = QGroupBox("Reference State")
         ref_layout = QHBoxLayout()
         ref_layout.setContentsMargins(10, 5, 10, 5)
@@ -1022,13 +1098,16 @@ class ControllerComparisonGUI(QMainWindow):
         
         ref_layout.addStretch()
         ref_state_group.setLayout(ref_layout)
-        layout.addWidget(ref_state_group)
+        sim_tab_layout.addWidget(ref_state_group)
         
-        # Attitude Control Debug group
-        att_debug_group = QGroupBox("Attitude Control Debug")
-        att_debug_layout = QVBoxLayout()
-        att_debug_layout.setContentsMargins(10, 5, 10, 5)
-        att_debug_layout.setSpacing(5)
+        sim_tab_layout.addStretch()
+        self.controller_params_tabs.addTab(sim_tab, "Simulation")
+        
+        # Attitude Debug tab
+        att_debug_tab = QWidget()
+        att_debug_tab_layout = QVBoxLayout()
+        att_debug_tab_layout.setContentsMargins(10, 10, 10, 10)
+        att_debug_tab.setLayout(att_debug_tab_layout)
         
         # Initial attitude (compact, one line)
         init_att_layout = QHBoxLayout()
@@ -1057,7 +1136,7 @@ class ControllerComparisonGUI(QMainWindow):
         self.spin_yaw0.setMaximumWidth(80)
         init_att_layout.addWidget(self.spin_yaw0)
         init_att_layout.addStretch()
-        att_debug_layout.addLayout(init_att_layout)
+        att_debug_tab_layout.addLayout(init_att_layout)
         
         # Reference attitude (compact, one line)
         ref_att_layout = QHBoxLayout()
@@ -1086,24 +1165,52 @@ class ControllerComparisonGUI(QMainWindow):
         self.spin_yaw_ref.setMaximumWidth(80)
         ref_att_layout.addWidget(self.spin_yaw_ref)
         ref_att_layout.addStretch()
-        att_debug_layout.addLayout(ref_att_layout)
+        att_debug_tab_layout.addLayout(ref_att_layout)
         
-        # Run attitude debug button
-        self.btn_run_att_debug = QPushButton("Run Attitude Debug")
-        self.btn_run_att_debug.setFont(QFont("Arial", 10, QFont.Bold))
-        self.btn_run_att_debug.setStyleSheet("background-color: #2196F3; color: white; padding: 8px;")
-        self.btn_run_att_debug.clicked.connect(self.run_attitude_debug)
-        att_debug_layout.addWidget(self.btn_run_att_debug)
+        att_debug_tab_layout.addStretch()
+        self.controller_params_tabs.addTab(att_debug_tab, "Attitude Debug")
         
-        att_debug_group.setLayout(att_debug_layout)
-        layout.addWidget(att_debug_group)
+        layout.addWidget(self.controller_params_tabs)
         
-        # Run button
+        # Parameter management buttons (smaller size)
+        param_buttons_group = QGroupBox("Parameter Management")
+        param_buttons_layout = QHBoxLayout()
+        param_buttons_layout.setContentsMargins(10, 5, 10, 5)
+        
+        self.btn_save_params = QPushButton("Save Parameters")
+        self.btn_save_params.setFont(QFont("Arial", 9))
+        self.btn_save_params.setStyleSheet("background-color: #FF9800; color: white; padding: 5px;")
+        self.btn_save_params.setMaximumHeight(30)
+        self.btn_save_params.clicked.connect(self.save_parameters)
+        param_buttons_layout.addWidget(self.btn_save_params)
+        
+        self.btn_load_params = QPushButton("Load Parameters")
+        self.btn_load_params.setFont(QFont("Arial", 9))
+        self.btn_load_params.setStyleSheet("background-color: #9C27B0; color: white; padding: 5px;")
+        self.btn_load_params.setMaximumHeight(30)
+        self.btn_load_params.clicked.connect(self.load_parameters)
+        param_buttons_layout.addWidget(self.btn_load_params)
+        
+        param_buttons_group.setLayout(param_buttons_layout)
+        layout.addWidget(param_buttons_group)
+        
+        # Run buttons (side by side)
+        run_buttons_layout = QHBoxLayout()
+        run_buttons_layout.setSpacing(10)
+        
         self.btn_run = QPushButton("Run Simulation")
         self.btn_run.setFont(QFont("Arial", 12, QFont.Bold))
         self.btn_run.setStyleSheet("background-color: #4CAF50; color: white; padding: 10px;")
         self.btn_run.clicked.connect(self.run_simulation)
-        layout.addWidget(self.btn_run)
+        run_buttons_layout.addWidget(self.btn_run)
+        
+        self.btn_run_att_debug = QPushButton("Run Attitude Debug")
+        self.btn_run_att_debug.setFont(QFont("Arial", 12, QFont.Bold))
+        self.btn_run_att_debug.setStyleSheet("background-color: #2196F3; color: white; padding: 10px;")
+        self.btn_run_att_debug.clicked.connect(self.run_attitude_debug)
+        run_buttons_layout.addWidget(self.btn_run_att_debug)
+        
+        layout.addLayout(run_buttons_layout)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -1184,6 +1291,14 @@ class ControllerComparisonGUI(QMainWindow):
             DIST_COM_2_THRUST=0.5693,
         )
         self.simulator = ComparisonSimulator(phy_params, dt=0.01)
+        
+        # Recreate PID controller with default limits (will be updated when GUI loads parameters)
+        self.simulator.pid = PIDController(
+            self.simulator.params,
+            max_deflection_angle_deg=15.0,
+            max_angular_velocity_deg_s=86.0
+        )
+        
         self.log_status("Simulator initialized with default parameters")
     
     def update_controller_parameters(self):
@@ -1214,19 +1329,23 @@ class ControllerComparisonGUI(QMainWindow):
         if hasattr(self, 'pid_Kp_pos'):
             gains = {
                 'Kp_pos': np.array([self.pid_Kp_pos[i].value() for i in range(3)]),
-                'Ki_pos': np.array([self.pid_Ki_pos[i].value() for i in range(3)]),
-                'Kd_pos': np.array([self.pid_Kd_pos[i].value() for i in range(3)]),
                 'Kp_vel': np.array([self.pid_Kp_vel[i].value() for i in range(3)]),
                 'Ki_vel': np.array([self.pid_Ki_vel[i].value() for i in range(3)]),
                 'Kd_vel': np.array([self.pid_Kd_vel[i].value() for i in range(3)]),
                 'Kp_att': np.array([self.pid_Kp_att[i].value() for i in range(3)]),
-                'Ki_att': np.array([self.pid_Ki_att[i].value() for i in range(3)]),
-                'Kd_att': np.array([self.pid_Kd_att[i].value() for i in range(3)]),
                 'Kp_omega': np.array([self.pid_Kp_omega[i].value() for i in range(3)]),
                 'Ki_omega': np.array([self.pid_Ki_omega[i].value() for i in range(3)]),
                 'Kd_omega': np.array([self.pid_Kd_omega[i].value() for i in range(3)]),
             }
             self.simulator.pid.set_gains(gains)
+            
+            # Update control limits
+            if hasattr(self, 'spin_max_deflection_angle') and hasattr(self, 'spin_max_angular_velocity'):
+                self.simulator.pid.set_limits(
+                    max_deflection_angle_deg=self.spin_max_deflection_angle.value(),
+                    max_angular_velocity_deg_s=self.spin_max_angular_velocity.value()
+                )
+            
             self.log_status("Updated PID controller parameters")
     
     def get_selected_controllers(self):
@@ -1326,6 +1445,25 @@ class ControllerComparisonGUI(QMainWindow):
         sim_time = self.spin_t_end.value()
         dt = self.spin_dt.value()
         
+        # Get PID gains and limits from GUI
+        pid_gains = {}
+        if hasattr(self, 'pid_Kp_pos'):
+            pid_gains = {
+                'Kp_pos': np.array([self.pid_Kp_pos[i].value() for i in range(3)]),
+                'Kp_vel': np.array([self.pid_Kp_vel[i].value() for i in range(3)]),
+                'Ki_vel': np.array([self.pid_Ki_vel[i].value() for i in range(3)]),
+                'Kd_vel': np.array([self.pid_Kd_vel[i].value() for i in range(3)]),
+                'Kp_att': np.array([self.pid_Kp_att[i].value() for i in range(3)]),
+                'Kp_omega': np.array([self.pid_Kp_omega[i].value() for i in range(3)]),
+                'Ki_omega': np.array([self.pid_Ki_omega[i].value() for i in range(3)]),
+                'Kd_omega': np.array([self.pid_Kd_omega[i].value() for i in range(3)]),
+            }
+            # Add limits if available
+            if hasattr(self, 'spin_max_deflection_angle'):
+                pid_gains['max_deflection_angle_deg'] = self.spin_max_deflection_angle.value()
+            if hasattr(self, 'spin_max_angular_velocity'):
+                pid_gains['max_angular_velocity_deg_s'] = self.spin_max_angular_velocity.value()
+        
         # Disable button and show progress
         self.btn_run_att_debug.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -1337,7 +1475,7 @@ class ControllerComparisonGUI(QMainWindow):
         
         # Create and start worker thread
         self.att_debug_worker = AttitudeDebugWorker(
-            self.simulator.params, att_init_euler, att_ref_euler, sim_time, dt
+            self.simulator.params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains
         )
         self.att_debug_worker.progress.connect(self.log_status)
         self.att_debug_worker.finished.connect(self.on_attitude_debug_finished)
@@ -1404,6 +1542,242 @@ class ControllerComparisonGUI(QMainWindow):
         self.status_log.append(message)
         scrollbar = self.status_log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+    
+    def save_parameters(self):
+        """Save all controller parameters to the default JSON file"""
+        try:
+            # Collect all parameters
+            params = {}
+            
+            # Simulation parameters
+            params['simulation'] = {
+                't_end': self.spin_t_end.value(),
+                'dt': self.spin_dt.value()
+            }
+            
+            # Initial and reference states
+            params['states'] = {
+                'initial': {
+                    'x': self.spin_x0.value(),
+                    'y': self.spin_y0.value(),
+                    'z': self.spin_z0.value()
+                },
+                'reference': {
+                    'x': self.spin_x_ref.value(),
+                    'y': self.spin_y_ref.value(),
+                    'z': self.spin_z_ref.value()
+                }
+            }
+            
+            # Attitude debug parameters
+            params['attitude_debug'] = {
+                'initial': {
+                    'roll': self.spin_roll0.value(),
+                    'pitch': self.spin_pitch0.value(),
+                    'yaw': self.spin_yaw0.value()
+                },
+                'reference': {
+                    'roll': self.spin_roll_ref.value(),
+                    'pitch': self.spin_pitch_ref.value(),
+                    'yaw': self.spin_yaw_ref.value()
+                }
+            }
+            
+            # PID parameters
+            if hasattr(self, 'pid_Kp_pos'):
+                params['pid'] = {
+                    'Kp_pos': [self.pid_Kp_pos[i].value() for i in range(3)],
+                    'Kp_vel': [self.pid_Kp_vel[i].value() for i in range(3)],
+                    'Ki_vel': [self.pid_Ki_vel[i].value() for i in range(3)],
+                    'Kd_vel': [self.pid_Kd_vel[i].value() for i in range(3)],
+                    'Kp_att': [self.pid_Kp_att[i].value() for i in range(3)],
+                    'Kp_omega': [self.pid_Kp_omega[i].value() for i in range(3)],
+                    'Ki_omega': [self.pid_Ki_omega[i].value() for i in range(3)],
+                    'Kd_omega': [self.pid_Kd_omega[i].value() for i in range(3)]
+                }
+                # Add control limits
+                if hasattr(self, 'spin_max_deflection_angle'):
+                    params['pid']['max_deflection_angle_deg'] = self.spin_max_deflection_angle.value()
+                if hasattr(self, 'spin_max_angular_velocity'):
+                    params['pid']['max_angular_velocity_deg_s'] = self.spin_max_angular_velocity.value()
+            
+            # LQR Full-State parameters
+            if hasattr(self, 'lqr_full_Q'):
+                params['lqr_full'] = {
+                    'Q': [self.lqr_full_Q[i].value() for i in range(12)],
+                    'R': [self.lqr_full_R[i].value() for i in range(4)]
+                }
+            
+            # LQR Attitude-Only parameters
+            if hasattr(self, 'lqr_att_Q'):
+                params['lqr_attitude'] = {
+                    'Q': [self.lqr_att_Q[i].value() for i in range(6)],
+                    'R': [self.lqr_att_R[i].value() for i in range(3)]
+                }
+            
+            # Save to default parameter file
+            with open(self.param_file_path, 'w') as f:
+                json.dump(params, f, indent=4)
+            
+            self.log_status(f"Parameters saved to: {self.param_file_path}")
+            QMessageBox.information(self, "Success", f"Parameters saved successfully!")
+            
+        except Exception as e:
+            self.log_status(f"Error saving parameters: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to save parameters:\n{str(e)}")
+    
+    def auto_load_parameters(self):
+        """Automatically load parameters from the default file on startup"""
+        try:
+            if os.path.exists(self.param_file_path):
+                self._load_parameters_from_file(self.param_file_path, silent=True)
+                self.log_status(f"Parameters auto-loaded from: {self.param_file_path}")
+            else:
+                self.log_status("No parameter file found, using default parameters")
+        except Exception as e:
+            self.log_status(f"Warning: Could not auto-load parameters: {str(e)}")
+    
+    def load_parameters(self):
+        """Load controller parameters from a JSON file (with file dialog)"""
+        try:
+            # Get file path from user, default to the parameter file
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "Load Parameters", self.param_file_path, 
+                "JSON Files (*.json);;All Files (*)"
+            )
+            
+            if not file_path:
+                return  # User cancelled
+            
+            self._load_parameters_from_file(file_path, silent=False)
+            
+        except Exception as e:
+            self.log_status(f"Error loading parameters: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load parameters:\n{str(e)}")
+    
+    def _load_parameters_from_file(self, file_path, silent=False):
+        """Internal method to load parameters from a file"""
+        # Load from file
+        with open(file_path, 'r') as f:
+            params = json.load(f)
+            
+            # Load simulation parameters
+            if 'simulation' in params:
+                sim = params['simulation']
+                if 't_end' in sim:
+                    self.spin_t_end.setValue(sim['t_end'])
+                if 'dt' in sim:
+                    self.spin_dt.setValue(sim['dt'])
+            
+            # Load states
+            if 'states' in params:
+                states = params['states']
+                if 'initial' in states:
+                    init = states['initial']
+                    if 'x' in init:
+                        self.spin_x0.setValue(init['x'])
+                    if 'y' in init:
+                        self.spin_y0.setValue(init['y'])
+                    if 'z' in init:
+                        self.spin_z0.setValue(init['z'])
+                if 'reference' in states:
+                    ref = states['reference']
+                    if 'x' in ref:
+                        self.spin_x_ref.setValue(ref['x'])
+                    if 'y' in ref:
+                        self.spin_y_ref.setValue(ref['y'])
+                    if 'z' in ref:
+                        self.spin_z_ref.setValue(ref['z'])
+            
+            # Load attitude debug parameters
+            if 'attitude_debug' in params:
+                att_debug = params['attitude_debug']
+                if 'initial' in att_debug:
+                    init = att_debug['initial']
+                    if 'roll' in init:
+                        self.spin_roll0.setValue(init['roll'])
+                    if 'pitch' in init:
+                        self.spin_pitch0.setValue(init['pitch'])
+                    if 'yaw' in init:
+                        self.spin_yaw0.setValue(init['yaw'])
+                if 'reference' in att_debug:
+                    ref = att_debug['reference']
+                    if 'roll' in ref:
+                        self.spin_roll_ref.setValue(ref['roll'])
+                    if 'pitch' in ref:
+                        self.spin_pitch_ref.setValue(ref['pitch'])
+                    if 'yaw' in ref:
+                        self.spin_yaw_ref.setValue(ref['yaw'])
+            
+            # Load PID parameters
+            if 'pid' in params and hasattr(self, 'pid_Kp_pos'):
+                pid = params['pid']
+                if 'Kp_pos' in pid and len(pid['Kp_pos']) == 3:
+                    for i in range(3):
+                        self.pid_Kp_pos[i].setValue(pid['Kp_pos'][i])
+                if 'Kp_vel' in pid and len(pid['Kp_vel']) == 3:
+                    for i in range(3):
+                        self.pid_Kp_vel[i].setValue(pid['Kp_vel'][i])
+                if 'Ki_vel' in pid and len(pid['Ki_vel']) == 3:
+                    for i in range(3):
+                        self.pid_Ki_vel[i].setValue(pid['Ki_vel'][i])
+                if 'Kd_vel' in pid and len(pid['Kd_vel']) == 3:
+                    for i in range(3):
+                        self.pid_Kd_vel[i].setValue(pid['Kd_vel'][i])
+                if 'Kp_att' in pid and len(pid['Kp_att']) == 3:
+                    for i in range(3):
+                        self.pid_Kp_att[i].setValue(pid['Kp_att'][i])
+                if 'Kp_omega' in pid and len(pid['Kp_omega']) == 3:
+                    for i in range(3):
+                        self.pid_Kp_omega[i].setValue(pid['Kp_omega'][i])
+                if 'Ki_omega' in pid and len(pid['Ki_omega']) == 3:
+                    for i in range(3):
+                        self.pid_Ki_omega[i].setValue(pid['Ki_omega'][i])
+                if 'Kd_omega' in pid and len(pid['Kd_omega']) == 3:
+                    for i in range(3):
+                        self.pid_Kd_omega[i].setValue(pid['Kd_omega'][i])
+                
+                # Load control limits
+                if 'max_deflection_angle_deg' in pid and hasattr(self, 'spin_max_deflection_angle'):
+                    self.spin_max_deflection_angle.setValue(pid['max_deflection_angle_deg'])
+                if 'max_angular_velocity_deg_s' in pid and hasattr(self, 'spin_max_angular_velocity'):
+                    self.spin_max_angular_velocity.setValue(pid['max_angular_velocity_deg_s'])
+                
+                # Update controller limits after loading
+                if hasattr(self, 'spin_max_deflection_angle') and hasattr(self, 'spin_max_angular_velocity'):
+                    if hasattr(self, 'simulator') and hasattr(self.simulator, 'pid'):
+                        self.simulator.pid.set_limits(
+                            max_deflection_angle_deg=self.spin_max_deflection_angle.value(),
+                            max_angular_velocity_deg_s=self.spin_max_angular_velocity.value()
+                        )
+            
+            # Update all controller parameters after loading
+            if hasattr(self, 'simulator'):
+                self.update_controller_parameters()
+            
+            # Load LQR Full-State parameters
+            if 'lqr_full' in params and hasattr(self, 'lqr_full_Q'):
+                lqr_full = params['lqr_full']
+                if 'Q' in lqr_full and len(lqr_full['Q']) == 12:
+                    for i in range(12):
+                        self.lqr_full_Q[i].setValue(lqr_full['Q'][i])
+                if 'R' in lqr_full and len(lqr_full['R']) == 4:
+                    for i in range(4):
+                        self.lqr_full_R[i].setValue(lqr_full['R'][i])
+            
+            # Load LQR Attitude-Only parameters
+            if 'lqr_attitude' in params and hasattr(self, 'lqr_att_Q'):
+                lqr_att = params['lqr_attitude']
+                if 'Q' in lqr_att and len(lqr_att['Q']) == 6:
+                    for i in range(6):
+                        self.lqr_att_Q[i].setValue(lqr_att['Q'][i])
+                if 'R' in lqr_att and len(lqr_att['R']) == 3:
+                    for i in range(3):
+                        self.lqr_att_R[i].setValue(lqr_att['R'][i])
+            
+            if not silent:
+                self.log_status(f"Parameters loaded from: {file_path}")
+                QMessageBox.information(self, "Success", f"Parameters loaded successfully from:\n{file_path}")
 
 
 def main():
@@ -1418,6 +1792,14 @@ def main():
     
     # Set application style
     app.setStyle('Fusion')
+    
+    # Handle Ctrl+C gracefully
+    def signal_handler(sig, frame):
+        print("\nReceived interrupt signal (Ctrl+C), shutting down...")
+        app.quit()
+    
+    # Register signal handler for SIGINT (Ctrl+C)
+    signal.signal(signal.SIGINT, signal_handler)
     
     window = ControllerComparisonGUI()
     window.show()

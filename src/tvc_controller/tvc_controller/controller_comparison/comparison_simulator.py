@@ -102,7 +102,8 @@ class ComparisonSimulator:
         # Initialize controllers
         self.lqr_full = LQRFullStateController(phy_params)
         self.lqr_att = LQRAttitudeOnlyController(phy_params)
-        self.pid = PIDController(phy_params)
+        # Initialize PID with default limits (15 deg max deflection, 86 deg/s max angular velocity)
+        self.pid = PIDController(phy_params, max_deflection_angle_deg=15.0, max_angular_velocity_deg_s=86.0)
     
     def simulate(self, controller_name: str, state0: np.ndarray, 
                  state_ref: np.ndarray, t_end: float,
