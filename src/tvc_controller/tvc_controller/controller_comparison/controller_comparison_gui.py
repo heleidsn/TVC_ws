@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPushButton, QCheckBox, QLabel, QGroupBox, QTextEdit,
                              QProgressBar, QMessageBox, QTabWidget, QDoubleSpinBox,
                              QFormLayout, QScrollArea, QTableWidget, QTableWidgetItem, QFrame,
-                             QFileDialog, QSizePolicy)
+                             QFileDialog, QSizePolicy, QComboBox)
 from PyQt5.QtGui import QFont
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -34,6 +34,7 @@ matplotlib.rcParams['savefig.dpi'] = 100
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation
 from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 
@@ -45,12 +46,20 @@ if __name__ == "__main__" or __package__ is None:
     from controller_comparison.lqr_attitude_only import LQRAttitudeOnlyController
     from controller_comparison.pid_controller import PIDController
     from controller_comparison.comparison_simulator import ComparisonSimulator, SimulationResult
+    try:
+        from controller_comparison.debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 else:
     from .rocket_dynamics import PhyParams, RocketDynamics
     from .lqr_full_state import LQRFullStateController
     from .lqr_attitude_only import LQRAttitudeOnlyController
     from .pid_controller import PIDController
     from .comparison_simulator import ComparisonSimulator, SimulationResult
+    try:
+        from .debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 
 
 class SimulationWorker(QThread):
@@ -85,7 +94,7 @@ class AttitudeDebugWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
     
-    def __init__(self, phy_params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains=None):
+    def __init__(self, phy_params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains=None, debug_config=None):
         super().__init__()
         self.phy_params = phy_params
         self.att_init_euler = att_init_euler
@@ -93,6 +102,7 @@ class AttitudeDebugWorker(QThread):
         self.sim_time = sim_time
         self.dt = dt
         self.pid_gains = pid_gains  # PID gains dictionary from GUI
+        self.debug_config = debug_config  # Debug configuration for layer-by-layer testing
         
     def run(self):
         try:
@@ -143,9 +153,13 @@ class AttitudeDebugWorker(QThread):
             
             # Storage for results
             time_points = []
+            pos_traj = []  # Position trajectory
+            vel_traj = []  # Velocity trajectory
             att_euler_traj = []
             att_ref_euler_traj = []
+            vel_ref_traj = []  # Velocity reference trajectory (for debug mode)
             omega_traj = []
+            omega_ref_traj = []  # Angular velocity reference trajectory (for debug mode)
             control_traj = []
             
             # Reset controller
@@ -158,11 +172,33 @@ class AttitudeDebugWorker(QThread):
             
             self.progress.emit("Running attitude control simulation...")
             
+            # Create reference state for full control computation
+            rot_ref = Rotation.from_euler('ZYX', 
+                [self.att_ref_euler[2], self.att_ref_euler[1], self.att_ref_euler[0]], 
+                degrees=False)
+            quat_ref = rot_ref.as_quat()  # [x, y, z, w]
+            att_ref = quat_ref[:3]  # qx, qy, qz
+            
+            state_ref = np.array([
+                0.0, 0.0, 1.0,  # Position: x, y, z (1m altitude)
+                0.0, 0.0, 0.0,  # Velocity: vx, vy, vz
+                att_ref[0], att_ref[1], att_ref[2],  # Attitude: qx, qy, qz
+                0.0, 0.0, 0.0   # Angular velocity: p, q, r
+            ])
+            
             for step in range(num_steps):
                 t = step * self.dt
                 
-                # Compute control using attitude-only mode
-                u = pid.compute_attitude_control_only(state, self.att_ref_euler, self.dt)
+                # Compute control - use debug mode if configured, otherwise use attitude-only mode
+                debug_info = None
+                if self.debug_config and self.debug_config.mode != 'none':
+                    u, debug_info = pid.compute_control(state, state_ref, self.dt, 
+                                                       return_debug=True, 
+                                                       debug_config=self.debug_config, 
+                                                       t=t)
+                else:
+                    # Use attitude-only mode (original behavior)
+                    u = pid.compute_attitude_control_only(state, self.att_ref_euler, self.dt)
                 
                 # Compute dynamics
                 state_dot = dynamics.compute_dynamics(t, state, u)
@@ -178,11 +214,40 @@ class AttitudeDebugWorker(QThread):
                 euler = rot.as_euler('ZYX', degrees=False)  # [yaw, pitch, roll]
                 att_euler = np.array([euler[2], euler[1], euler[0]])  # [roll, pitch, yaw]
                 
+                # Extract reference from debug_info if available, otherwise use fixed reference
+                if debug_info is not None and 'att_ref_total' in debug_info:
+                    # Convert dynamic attitude reference from quaternion to Euler
+                    att_ref_q = debug_info['att_ref_total']
+                    qw_ref = np.sqrt(np.clip(1.0 - np.sum(att_ref_q**2), 0.0, 1.0))
+                    quat_ref = np.array([qw_ref, att_ref_q[0], att_ref_q[1], att_ref_q[2]])
+                    rot_ref = Rotation.from_quat([quat_ref[1], quat_ref[2], quat_ref[3], quat_ref[0]])
+                    euler_ref = rot_ref.as_euler('ZYX', degrees=False)  # [yaw, pitch, roll]
+                    att_ref_euler = np.array([euler_ref[2], euler_ref[1], euler_ref[0]])  # [roll, pitch, yaw]
+                else:
+                    # Use fixed reference
+                    att_ref_euler = self.att_ref_euler
+                
+                # Extract velocity reference from debug_info if available
+                if debug_info is not None and 'vel_cmd_total' in debug_info:
+                    vel_ref = debug_info['vel_cmd_total']
+                else:
+                    vel_ref = state_ref[3:6]  # Use fixed velocity reference
+                
+                # Extract angular velocity reference from debug_info if available
+                if debug_info is not None and 'omega_ref_total' in debug_info:
+                    omega_ref = debug_info['omega_ref_total']
+                else:
+                    omega_ref = state_ref[9:12]  # Use fixed angular velocity reference
+                
                 # Store for plotting
                 time_points.append(t)
+                pos_traj.append(state[0:3])  # Position [x, y, z]
+                vel_traj.append(state[3:6])  # Velocity [vx, vy, vz]
                 att_euler_traj.append(np.rad2deg(att_euler))
-                att_ref_euler_traj.append(np.rad2deg(self.att_ref_euler))
+                att_ref_euler_traj.append(np.rad2deg(att_ref_euler))
+                vel_ref_traj.append(vel_ref)
                 omega_traj.append(np.rad2deg(state[9:12]))
+                omega_ref_traj.append(np.rad2deg(omega_ref))
                 control_traj.append(u.copy())
                 
                 if step % 100 == 0:
@@ -191,9 +256,13 @@ class AttitudeDebugWorker(QThread):
             # Convert to numpy arrays
             result = {
                 'time': np.array(time_points),
+                'pos': np.array(pos_traj),  # Position [x, y, z]
+                'vel': np.array(vel_traj),  # Velocity [vx, vy, vz]
+                'vel_ref': np.array(vel_ref_traj),  # Velocity reference [vx, vy, vz]
                 'att_euler': np.array(att_euler_traj),
                 'att_ref_euler': np.array(att_ref_euler_traj),
                 'omega': np.array(omega_traj),
+                'omega_ref': np.array(omega_ref_traj),  # Angular velocity reference [p, q, r]
                 'control': np.array(control_traj),
                 'att_ref_euler_deg': np.rad2deg(self.att_ref_euler)
             }
@@ -218,9 +287,16 @@ class MatplotlibWidget(QWidget):
         
         # Enable size policy to allow resizing
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        # Store animation object
+        self.animation = None
     
     def clear(self):
         """Clear the figure"""
+        # Stop any existing animation
+        if self.animation is not None:
+            self.animation.event_source.stop()
+            self.animation = None
         self.figure.clear()
         self.canvas.draw_idle()
         self.canvas.flush_events()
@@ -241,7 +317,8 @@ class MatplotlibWidget(QWidget):
         """Plot state trajectories"""
         self.figure.clear()
         # Remove fixed size, let it adapt to widget size
-        axes = self.figure.subplots(4, 3)
+        # Changed to 5 rows x 3 columns to include control inputs in the last row
+        axes = self.figure.subplots(5, 3)
         self.figure.suptitle('State Trajectories Comparison', fontsize=14, fontweight='bold')
         
         colors = ['b', 'r', 'g', 'm', 'c', 'y']
@@ -251,7 +328,8 @@ class MatplotlibWidget(QWidget):
             ['Position X (m)', 'Position Y (m)', 'Position Z (m)'],
             ['Velocity Vx (m/s)', 'Velocity Vy (m/s)', 'Velocity Vz (m/s)'],
             ['Attitude Roll (deg)', 'Attitude Pitch (deg)', 'Attitude Yaw (deg)'],
-            ['Angular Vel P (deg/s)', 'Angular Vel Q (deg/s)', 'Angular Vel R (deg/s)']
+            ['Angular Vel P (deg/s)', 'Angular Vel Q (deg/s)', 'Angular Vel R (deg/s)'],
+            ['Control Phi (deg)', 'Control Theta (deg)', 'Control Thrust (N) / Tau_r (Nm)']
         ]
         
         def quaternion_to_euler(q_vec):
@@ -277,47 +355,79 @@ class MatplotlibWidget(QWidget):
             # Check if desired trajectory exists (for PID controller with position input)
             has_desired = (result.desired_traj is not None and result.controller_name == 'pid')
             
-            for i in range(4):
+            for i in range(5):
                 for j in range(3):
-                    state_idx = i * 3 + j
-                    if i == 2:  # Attitude row - convert to Euler angles
-                        euler_traj = quaternion_to_euler(result.state_traj[:, 6:9])
-                        euler_ref = quaternion_to_euler(result.state_ref_traj[:, 6:9])
-                        axes[i, j].plot(time, np.degrees(euler_traj[:, j]), 
-                                       color=color, label=name, linestyle=linestyle, linewidth=2)
-                        axes[i, j].plot(time, np.degrees(euler_ref[:, j]), 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
-                        # Plot desired attitude if available
-                        if has_desired:
-                            axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
-                                           color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
-                    elif i == 3:  # Angular velocity row - convert from rad/s to deg/s
-                        axes[i, j].plot(time, np.degrees(result.state_traj[:, state_idx]), 
-                                       color=color, label=name, linestyle=linestyle, linewidth=2)
-                        axes[i, j].plot(time, np.degrees(result.state_ref_traj[:, state_idx]), 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
-                        # Plot desired angular velocity if available
-                        if has_desired:
-                            axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
-                                           color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
+                    if i == 4:  # Control inputs row
+                        if j == 0:  # Phi
+                            axes[i, j].plot(time, np.degrees(result.control_traj[:, 0]), 
+                                           color=color, label=name, linestyle=linestyle, linewidth=2)
+                        elif j == 1:  # Theta
+                            axes[i, j].plot(time, np.degrees(result.control_traj[:, 1]), 
+                                           color=color, label=name, linestyle=linestyle, linewidth=2)
+                        else:  # j == 2: Thrust and Tau_r (dual y-axis)
+                            ax_twin = axes[i, j].twinx()
+                            axes[i, j].plot(time, result.control_traj[:, 2], 
+                                           color=color, label=f'{name} Thrust', linestyle=linestyle, linewidth=2)
+                            ax_twin.plot(time, result.control_traj[:, 3], 
+                                        color=color, label=f'{name} Tau_r', linestyle='--', linewidth=1.5, alpha=0.7)
+                            axes[i, j].set_ylabel('Thrust (N)', fontsize=9, color=color)
+                            ax_twin.set_ylabel('Tau_r (Nm)', fontsize=9, color=color)
+                            ax_twin.tick_params(axis='y', labelcolor=color)
+                            # Combine legends
+                            lines1, labels1 = axes[i, j].get_legend_handles_labels()
+                            lines2, labels2 = ax_twin.get_legend_handles_labels()
+                            axes[i, j].legend(lines1 + lines2, labels1 + labels2, loc='best', fontsize=8)
                     else:
-                        axes[i, j].plot(time, result.state_traj[:, state_idx], 
-                                       color=color, label=name, linestyle=linestyle, linewidth=2)
-                        axes[i, j].plot(time, result.state_ref_traj[:, state_idx], 
-                                       color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
-                        # Plot desired values if available (skip position, as it's user-specified)
-                        if has_desired and i > 0:  # Skip position (i=0) as it's user-specified, not controller output
-                            desired_vals = result.desired_traj[:, state_idx]
-                            # Only plot if not all NaN
-                            if not np.all(np.isnan(desired_vals)):
-                                axes[i, j].plot(time, desired_vals, 
+                        state_idx = i * 3 + j
+                        if i == 2:  # Attitude row - convert to Euler angles
+                            euler_traj = quaternion_to_euler(result.state_traj[:, 6:9])
+                            euler_ref = quaternion_to_euler(result.state_ref_traj[:, 6:9])
+                            axes[i, j].plot(time, np.degrees(euler_traj[:, j]), 
+                                           color=color, label=name, linestyle=linestyle, linewidth=2)
+                            axes[i, j].plot(time, np.degrees(euler_ref[:, j]), 
+                                           color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                            # Plot desired attitude if available
+                            if has_desired:
+                                axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
                                                color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
-                    axes[i, j].set_title(state_labels[i][j], fontsize=10)
+                        elif i == 3:  # Angular velocity row - convert from rad/s to deg/s
+                            axes[i, j].plot(time, np.degrees(result.state_traj[:, state_idx]), 
+                                           color=color, label=name, linestyle=linestyle, linewidth=2)
+                            axes[i, j].plot(time, np.degrees(result.state_ref_traj[:, state_idx]), 
+                                           color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                            # Plot desired angular velocity if available
+                            if has_desired:
+                                axes[i, j].plot(time, np.degrees(result.desired_traj[:, state_idx]), 
+                                               color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
+                        else:
+                            axes[i, j].plot(time, result.state_traj[:, state_idx], 
+                                           color=color, label=name, linestyle=linestyle, linewidth=2)
+                            axes[i, j].plot(time, result.state_ref_traj[:, state_idx], 
+                                           color=color, linestyle='--', alpha=0.4, linewidth=1, label=f'{name} Ref')
+                            # Plot desired values if available (skip position, as it's user-specified)
+                            if has_desired and i > 0:  # Skip position (i=0) as it's user-specified, not controller output
+                                desired_vals = result.desired_traj[:, state_idx]
+                                # Only plot if not all NaN
+                                if not np.all(np.isnan(desired_vals)):
+                                    axes[i, j].plot(time, desired_vals, 
+                                                   color=color, linestyle=':', alpha=0.7, linewidth=1.5, label=f'{name} Desired')
+                    if i < 4:  # Only set title and labels for state rows, not control row
+                        axes[i, j].set_title(state_labels[i][j], fontsize=10)
+                    else:  # Control row
+                        if j < 2:
+                            axes[i, j].set_title(state_labels[i][j], fontsize=10)
+                        else:
+                            axes[i, j].set_title(state_labels[i][j], fontsize=10)
                     axes[i, j].grid(True, alpha=0.3)
                     axes[i, j].set_xlabel('Time (s)', fontsize=9)
+                    if i < 4 or j < 2:  # Only set ylabel for non-dual-axis plots
+                        axes[i, j].set_ylabel(state_labels[i][j].split('(')[0].strip(), fontsize=9)
         
-        for ax in axes.flat:
-            ax.legend(loc='best', fontsize=8)
+        # Set legends for all axes except the dual-axis control plot (already has legend)
+        for i in range(5):
+            for j in range(3):
+                if not (i == 4 and j == 2):  # Skip the dual-axis plot (legend already set in the loop)
+                    axes[i, j].legend(loc='best', fontsize=8)
         
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -438,56 +548,201 @@ class MatplotlibWidget(QWidget):
         self.update()
     
     def plot_3d_trajectory(self, results):
-        """Plot 3D trajectory"""
+        """Plot 3D trajectory as animation"""
         self.figure.clear()
+        # Stop any existing animation
+        if self.animation is not None:
+            self.animation.event_source.stop()
+            self.animation = None
+        
         # Remove fixed size, let it adapt to widget size
         ax = self.figure.add_subplot(111, projection='3d')
-        ax.set_title('3D Trajectory Comparison', fontsize=14, fontweight='bold')
+        ax.set_title('3D Trajectory Comparison (Animation)', fontsize=14, fontweight='bold')
         
         colors = ['b', 'r', 'g', 'm', 'c', 'y']
         linestyles = ['-', '-', '-', '-', '-', '-']
         
-        # Track if we've already plotted start and target points (to avoid duplicates in legend)
-        start_plotted = False
-        target_plotted = False
+        # Prepare data for animation
+        trajectories = []
+        names = []
+        max_length = 0
         
         for idx, (name, result) in enumerate(results.items()):
-            color = colors[idx % len(colors)]
-            linestyle = linestyles[idx % len(linestyles)]
-            
-            # Plot trajectory
-            ax.plot(result.state_traj[:, 0], result.state_traj[:, 1], 
-                   result.state_traj[:, 2], color=color, label=name, 
-                   linestyle=linestyle, linewidth=2, alpha=0.8)
-            
-            # Plot start point (green circle, larger size)
-            if not start_plotted:
-                ax.scatter(result.state_traj[0, 0], result.state_traj[0, 1], 
-                          result.state_traj[0, 2], color='green', s=200, marker='o', 
-                          edgecolors='darkgreen', linewidths=2, label='起始点 (Start)', zorder=10)
-                start_plotted = True
-            else:
-                ax.scatter(result.state_traj[0, 0], result.state_traj[0, 1], 
-                          result.state_traj[0, 2], color='green', s=200, marker='o', 
-                          edgecolors='darkgreen', linewidths=2, zorder=10)
-            
-            # Plot target point (red star, from reference state)
-            target_pos = result.state_ref_traj[0, 0:3]  # Get target position from reference
-            if not target_plotted:
-                ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
-                          color='red', s=300, marker='*', 
-                          edgecolors='darkred', linewidths=2, label='目标点 (Target)', zorder=10)
-                target_plotted = True
-            else:
-                ax.scatter(target_pos[0], target_pos[1], target_pos[2], 
-                          color='red', s=300, marker='*', 
-                          edgecolors='darkred', linewidths=2, zorder=10)
+            # Extract attitude (quaternion) from state trajectory
+            att_traj = result.state_traj[:, 6:9]  # qx, qy, qz
+            trajectories.append({
+                'x': result.state_traj[:, 0],
+                'y': result.state_traj[:, 1],
+                'z': result.state_traj[:, 2],
+                'att': att_traj,  # Attitude quaternion vector
+                'color': colors[idx % len(colors)],
+                'linestyle': linestyles[idx % len(linestyles)],
+                'name': name
+            })
+            names.append(name)
+            max_length = max(max_length, len(result.state_traj))
         
+        # Get start and target points from first result
+        first_result = list(results.values())[0]
+        start_pos = first_result.state_traj[0, 0:3]
+        target_pos = first_result.state_ref_traj[0, 0:3]
+        
+        # Initialize plot elements
+        lines = []
+        attitude_arrows = []  # Store arrow objects for attitude visualization
+        
+        for traj in trajectories:
+            line, = ax.plot([], [], [], color=traj['color'], 
+                           label=traj['name'], linestyle=traj['linestyle'], 
+                           linewidth=2, alpha=0.8)
+            lines.append(line)
+            
+            # Initialize rocket shape (will be updated in animation)
+            # Rocket size proportional to trajectory scale
+            rocket_length = 0.4 * max(np.max(traj['x']) - np.min(traj['x']),
+                                     np.max(traj['y']) - np.min(traj['y']),
+                                     np.max(traj['z']) - np.min(traj['z']))
+            rocket_length = max(0.15, min(rocket_length, 0.6))  # Limit between 0.15 and 0.6 m
+            
+            # Create rocket shape (will be created in first frame)
+            rocket_shape = None  # Will be created in first frame
+            attitude_arrows.append({
+                'arrow': rocket_shape,
+                'length': rocket_length,
+                'color': traj['color']
+            })
+        
+        # Plot start point (green circle)
+        start_point = ax.scatter([], [], [], color='green', s=200, marker='o', 
+                                 edgecolors='darkgreen', linewidths=2, 
+                                 label='Start Point', zorder=10)
+        start_point._offsets3d = ([start_pos[0]], [start_pos[1]], [start_pos[2]])
+        
+        # Plot target point (red star)
+        target_point = ax.scatter([], [], [], color='red', s=300, marker='*', 
+                                  edgecolors='darkred', linewidths=2, 
+                                  label='Target Point', zorder=10)
+        target_point._offsets3d = ([target_pos[0]], [target_pos[1]], [target_pos[2]])
+        
+        # Set axis labels (English)
         ax.set_xlabel('X (m)', fontsize=11)
         ax.set_ylabel('Y (m)', fontsize=11)
         ax.set_zlabel('Z (m)', fontsize=11)
+        
+        # Calculate axis limits
+        all_x = np.concatenate([traj['x'] for traj in trajectories])
+        all_y = np.concatenate([traj['y'] for traj in trajectories])
+        all_z = np.concatenate([traj['z'] for traj in trajectories])
+        
+        ax.set_xlim([np.min(all_x) - 0.5, np.max(all_x) + 0.5])
+        ax.set_ylim([np.min(all_y) - 0.5, np.max(all_y) + 0.5])
+        ax.set_zlim([np.min(all_z) - 0.5, np.max(all_z) + 0.5])
+        
         ax.legend(loc='best', fontsize=10)
         ax.grid(True, alpha=0.3)
+        
+        # Animation function
+        def animate(frame):
+            # Update each trajectory line
+            for i, (line, traj) in enumerate(zip(lines, trajectories)):
+                if frame < len(traj['x']):
+                    # For 3D lines, we need to set data using _verts3d
+                    line.set_data(traj['x'][:frame+1], traj['y'][:frame+1])
+                    line.set_3d_properties(traj['z'][:frame+1])
+                else:
+                    # Keep full trajectory if frame exceeds length
+                    line.set_data(traj['x'], traj['y'])
+                    line.set_3d_properties(traj['z'])
+            
+            # Update coordinate frames (like ROS TF)
+            # Remove old coordinate frames first
+            for arrow_info in attitude_arrows:
+                if arrow_info['arrow'] is not None:
+                    for line in arrow_info['arrow']:
+                        line.remove()
+                    arrow_info['arrow'] = None
+            
+            # Create new coordinate frames at current position
+            for i, (traj, arrow_info) in enumerate(zip(trajectories, attitude_arrows)):
+                if frame < len(traj['x']):
+                    # Get current position
+                    pos = np.array([traj['x'][frame], traj['y'][frame], traj['z'][frame]])
+                    
+                    # Get current attitude quaternion
+                    q_vec = traj['att'][frame]
+                    qw = np.sqrt(np.clip(1.0 - np.sum(q_vec**2), 0.0, 1.0))
+                    quat = np.array([qw, q_vec[0], q_vec[1], q_vec[2]])  # [w, x, y, z]
+                    
+                    # Convert quaternion to rotation matrix
+                    rot = Rotation.from_quat([quat[1], quat[2], quat[3], quat[0]])  # [x, y, z, w]
+                    
+                    # Get body frame axes in world frame (like ROS TF)
+                    # Body frame: x=forward, y=left, z=up (ENU convention)
+                    body_x = rot.apply([1, 0, 0])  # Body x-axis (forward/roll axis)
+                    body_y = rot.apply([0, 1, 0])  # Body y-axis (left/pitch axis)
+                    body_z = rot.apply([0, 0, 1])  # Body z-axis (up/yaw axis)
+                    
+                    axis_length = arrow_info['length']
+                    axis_width = 2.5
+                    
+                    frame_lines = []
+                    
+                    # X-axis (red) - forward/roll axis
+                    x_end = pos + body_x * axis_length
+                    x_line, = ax.plot([pos[0], x_end[0]], 
+                                     [pos[1], x_end[1]], 
+                                     [pos[2], x_end[2]],
+                                     color='red', 
+                                     linewidth=axis_width,
+                                     alpha=0.9,
+                                     label='X (Roll)' if i == 0 and frame == 0 else '')
+                    frame_lines.append(x_line)
+                    
+                    # Y-axis (green) - left/pitch axis
+                    y_end = pos + body_y * axis_length
+                    y_line, = ax.plot([pos[0], y_end[0]], 
+                                     [pos[1], y_end[1]], 
+                                     [pos[2], y_end[2]],
+                                     color='green', 
+                                     linewidth=axis_width,
+                                     alpha=0.9,
+                                     label='Y (Pitch)' if i == 0 and frame == 0 else '')
+                    frame_lines.append(y_line)
+                    
+                    # Z-axis (blue) - up/yaw axis
+                    z_end = pos + body_z * axis_length
+                    z_line, = ax.plot([pos[0], z_end[0]], 
+                                     [pos[1], z_end[1]], 
+                                     [pos[2], z_end[2]],
+                                     color='blue', 
+                                     linewidth=axis_width,
+                                     alpha=0.9,
+                                     label='Z (Yaw)' if i == 0 and frame == 0 else '')
+                    frame_lines.append(z_line)
+                    
+                    arrow_info['arrow'] = frame_lines
+            
+            # Update title with current time
+            if len(trajectories) > 0:
+                first_traj = trajectories[0]
+                if frame < len(first_traj['x']):
+                    # Get time from first result if available
+                    first_result = list(results.values())[0]
+                    if hasattr(first_result, 'time') and len(first_result.time) > frame:
+                        current_time = first_result.time[frame]
+                        ax.set_title(f'3D Trajectory Comparison (Animation) - Time: {current_time:.2f} s', 
+                                   fontsize=14, fontweight='bold')
+                    else:
+                        ax.set_title(f'3D Trajectory Comparison (Animation) - Frame: {frame}/{max_length-1}', 
+                                   fontsize=14, fontweight='bold')
+            
+            return lines + [start_point, target_point]
+        
+        # Create animation
+        # Use interval of 20ms for higher fps (50fps), skip frames if trajectory is too long
+        skip_frames = max(1, max_length // 1000)  # Limit to ~1000 frames max for smoother animation
+        self.animation = FuncAnimation(self.figure, animate, frames=range(0, max_length, skip_frames),
+                                       interval=20, blit=False, repeat=True)
         
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -498,91 +753,173 @@ class MatplotlibWidget(QWidget):
         """Plot attitude control debug results"""
         self.figure.clear()
         # Remove fixed size, let it adapt to widget size
-        axes = self.figure.subplots(3, 3)
+        # Changed to 5 rows x 3 columns to include position and velocity
+        axes = self.figure.subplots(5, 3)
         self.figure.suptitle(f'PID Attitude Control Response\nReference: Roll={result["att_ref_euler_deg"][0]:.1f}°, '
                              f'Pitch={result["att_ref_euler_deg"][1]:.1f}°, Yaw={result["att_ref_euler_deg"][2]:.1f}°', 
                              fontsize=14)
         
         time_points = result['time']
+        pos_traj = result['pos']  # Position [x, y, z]
+        vel_traj = result['vel']  # Velocity [vx, vy, vz]
+        vel_ref_traj = result.get('vel_ref', None)  # Velocity reference (may not exist in old results)
         att_euler_traj = result['att_euler']
         att_ref_euler_traj = result['att_ref_euler']
         omega_traj = result['omega']
+        omega_ref_traj = result.get('omega_ref', None)  # Angular velocity reference (may not exist in old results)
         control_traj = result['control']
         
-        # Plot 1: Roll (control result)
-        axes[0, 0].plot(time_points, att_euler_traj[:, 0], 'b-', label='Roll', linewidth=2)
-        axes[0, 0].plot(time_points, att_ref_euler_traj[:, 0], 'b--', label='Roll Ref', linewidth=1)
+        # Row 0: Position (added at the front)
+        # Plot 1: Position X
+        axes[0, 0].plot(time_points, pos_traj[:, 0], 'b-', label='X', linewidth=2)
+        axes[0, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         axes[0, 0].set_xlabel('Time (s)')
-        axes[0, 0].set_ylabel('Roll (deg)')
-        axes[0, 0].set_title('Control Result: Roll')
+        axes[0, 0].set_ylabel('X (m)')
+        axes[0, 0].set_title('Position: X (East)')
         axes[0, 0].grid(True)
         axes[0, 0].legend()
         
-        # Plot 2: Pitch (control result)
-        axes[0, 1].plot(time_points, att_euler_traj[:, 1], 'r-', label='Pitch', linewidth=2)
-        axes[0, 1].plot(time_points, att_ref_euler_traj[:, 1], 'r--', label='Pitch Ref', linewidth=1)
+        # Plot 2: Position Y
+        axes[0, 1].plot(time_points, pos_traj[:, 1], 'r-', label='Y', linewidth=2)
+        axes[0, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         axes[0, 1].set_xlabel('Time (s)')
-        axes[0, 1].set_ylabel('Pitch (deg)')
-        axes[0, 1].set_title('Control Result: Pitch')
+        axes[0, 1].set_ylabel('Y (m)')
+        axes[0, 1].set_title('Position: Y (North)')
         axes[0, 1].grid(True)
         axes[0, 1].legend()
         
-        # Plot 3: Yaw (control result)
-        axes[0, 2].plot(time_points, att_euler_traj[:, 2], 'g-', label='Yaw', linewidth=2)
-        axes[0, 2].plot(time_points, att_ref_euler_traj[:, 2], 'g--', label='Yaw Ref', linewidth=1)
+        # Plot 3: Position Z
+        axes[0, 2].plot(time_points, pos_traj[:, 2], 'g-', label='Z', linewidth=2)
+        axes[0, 2].axhline(y=1.0, color='k', linestyle='--', alpha=0.3, label='Initial')
         axes[0, 2].set_xlabel('Time (s)')
-        axes[0, 2].set_ylabel('Yaw (deg)')
-        axes[0, 2].set_title('Control Result: Yaw')
+        axes[0, 2].set_ylabel('Z (m)')
+        axes[0, 2].set_title('Position: Z (Up/Altitude)')
         axes[0, 2].grid(True)
         axes[0, 2].legend()
         
-        # Plot 4: Angular velocity p (roll rate)
-        axes[1, 0].plot(time_points, omega_traj[:, 0], 'b-', label='p (roll rate)', linewidth=2)
-        axes[1, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        # Row 1: Velocity (added at the front)
+        # Plot 4: Velocity Vx
+        axes[1, 0].plot(time_points, vel_traj[:, 0], 'b-', label='Vx', linewidth=2)
+        if vel_ref_traj is not None:
+            axes[1, 0].plot(time_points, vel_ref_traj[:, 0], 'b--', label='Vx Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[1, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         axes[1, 0].set_xlabel('Time (s)')
-        axes[1, 0].set_ylabel('p (deg/s)')
-        axes[1, 0].set_title('Angular Velocity: p (Roll Rate)')
+        axes[1, 0].set_ylabel('Vx (m/s)')
+        axes[1, 0].set_title('Velocity: Vx (East)')
         axes[1, 0].grid(True)
         axes[1, 0].legend()
         
-        # Plot 5: Angular velocity q (pitch rate)
-        axes[1, 1].plot(time_points, omega_traj[:, 1], 'r-', label='q (pitch rate)', linewidth=2)
-        axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        # Plot 5: Velocity Vy
+        axes[1, 1].plot(time_points, vel_traj[:, 1], 'r-', label='Vy', linewidth=2)
+        if vel_ref_traj is not None:
+            axes[1, 1].plot(time_points, vel_ref_traj[:, 1], 'r--', label='Vy Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         axes[1, 1].set_xlabel('Time (s)')
-        axes[1, 1].set_ylabel('q (deg/s)')
-        axes[1, 1].set_title('Angular Velocity: q (Pitch Rate)')
+        axes[1, 1].set_ylabel('Vy (m/s)')
+        axes[1, 1].set_title('Velocity: Vy (North)')
         axes[1, 1].grid(True)
         axes[1, 1].legend()
         
-        # Plot 6: Angular velocity r (yaw rate)
-        axes[1, 2].plot(time_points, omega_traj[:, 2], 'g-', label='r (yaw rate)', linewidth=2)
-        axes[1, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        # Plot 6: Velocity Vz
+        axes[1, 2].plot(time_points, vel_traj[:, 2], 'g-', label='Vz', linewidth=2)
+        if vel_ref_traj is not None:
+            axes[1, 2].plot(time_points, vel_ref_traj[:, 2], 'g--', label='Vz Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[1, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
         axes[1, 2].set_xlabel('Time (s)')
-        axes[1, 2].set_ylabel('r (deg/s)')
-        axes[1, 2].set_title('Angular Velocity: r (Yaw Rate)')
+        axes[1, 2].set_ylabel('Vz (m/s)')
+        axes[1, 2].set_title('Velocity: Vz (Up)')
         axes[1, 2].grid(True)
         axes[1, 2].legend()
         
-        # Plot 7: Phi (control input)
-        axes[2, 0].plot(time_points, np.rad2deg(control_traj[:, 0]), 'b-', label='Phi', linewidth=2)
-        axes[2, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        # Row 2: Attitude (moved from row 0)
+        # Plot 7: Roll (control result)
+        axes[2, 0].plot(time_points, att_euler_traj[:, 0], 'b-', label='Roll', linewidth=2)
+        axes[2, 0].plot(time_points, att_ref_euler_traj[:, 0], 'b--', label='Roll Ref', linewidth=1)
         axes[2, 0].set_xlabel('Time (s)')
-        axes[2, 0].set_ylabel('Phi (deg)')
-        axes[2, 0].set_title('Control Input: Phi (Deflection)')
+        axes[2, 0].set_ylabel('Roll (deg)')
+        axes[2, 0].set_title('Control Result: Roll')
         axes[2, 0].grid(True)
         axes[2, 0].legend()
         
-        # Plot 8: Theta (control input)
-        axes[2, 1].plot(time_points, np.rad2deg(control_traj[:, 1]), 'r-', label='Theta', linewidth=2)
-        axes[2, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        # Plot 8: Pitch (control result)
+        axes[2, 1].plot(time_points, att_euler_traj[:, 1], 'r-', label='Pitch', linewidth=2)
+        axes[2, 1].plot(time_points, att_ref_euler_traj[:, 1], 'r--', label='Pitch Ref', linewidth=1)
         axes[2, 1].set_xlabel('Time (s)')
-        axes[2, 1].set_ylabel('Theta (deg)')
-        axes[2, 1].set_title('Control Input: Theta (Deflection)')
+        axes[2, 1].set_ylabel('Pitch (deg)')
+        axes[2, 1].set_title('Control Result: Pitch')
         axes[2, 1].grid(True)
         axes[2, 1].legend()
         
-        # Plot 9: Thrust and Yaw Torque (control input) - dual y-axis
-        ax_thrust = axes[2, 2]
+        # Plot 9: Yaw (control result)
+        axes[2, 2].plot(time_points, att_euler_traj[:, 2], 'g-', label='Yaw', linewidth=2)
+        axes[2, 2].plot(time_points, att_ref_euler_traj[:, 2], 'g--', label='Yaw Ref', linewidth=1)
+        axes[2, 2].set_xlabel('Time (s)')
+        axes[2, 2].set_ylabel('Yaw (deg)')
+        axes[2, 2].set_title('Control Result: Yaw')
+        axes[2, 2].grid(True)
+        axes[2, 2].legend()
+        
+        # Row 3: Angular velocity (moved from row 1)
+        # Plot 10: Angular velocity p (roll rate)
+        axes[3, 0].plot(time_points, omega_traj[:, 0], 'b-', label='p (roll rate)', linewidth=2)
+        if omega_ref_traj is not None:
+            axes[3, 0].plot(time_points, omega_ref_traj[:, 0], 'b--', label='p Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[3, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[3, 0].set_xlabel('Time (s)')
+        axes[3, 0].set_ylabel('p (deg/s)')
+        axes[3, 0].set_title('Angular Velocity: p (Roll Rate)')
+        axes[3, 0].grid(True)
+        axes[3, 0].legend()
+        
+        # Plot 11: Angular velocity q (pitch rate)
+        axes[3, 1].plot(time_points, omega_traj[:, 1], 'r-', label='q (pitch rate)', linewidth=2)
+        if omega_ref_traj is not None:
+            axes[3, 1].plot(time_points, omega_ref_traj[:, 1], 'r--', label='q Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[3, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[3, 1].set_xlabel('Time (s)')
+        axes[3, 1].set_ylabel('q (deg/s)')
+        axes[3, 1].set_title('Angular Velocity: q (Pitch Rate)')
+        axes[3, 1].grid(True)
+        axes[3, 1].legend()
+        
+        # Plot 12: Angular velocity r (yaw rate)
+        axes[3, 2].plot(time_points, omega_traj[:, 2], 'g-', label='r (yaw rate)', linewidth=2)
+        if omega_ref_traj is not None:
+            axes[3, 2].plot(time_points, omega_ref_traj[:, 2], 'g--', label='r Ref', linewidth=1, alpha=0.7)
+        else:
+            axes[3, 2].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[3, 2].set_xlabel('Time (s)')
+        axes[3, 2].set_ylabel('r (deg/s)')
+        axes[3, 2].set_title('Angular Velocity: r (Yaw Rate)')
+        axes[3, 2].grid(True)
+        axes[3, 2].legend()
+        
+        # Row 4: Control inputs (moved from row 2)
+        # Plot 13: Phi (control input)
+        axes[4, 0].plot(time_points, np.rad2deg(control_traj[:, 0]), 'b-', label='Phi', linewidth=2)
+        axes[4, 0].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[4, 0].set_xlabel('Time (s)')
+        axes[4, 0].set_ylabel('Phi (deg)')
+        axes[4, 0].set_title('Control Input: Phi (Deflection)')
+        axes[4, 0].grid(True)
+        axes[4, 0].legend()
+        
+        # Plot 14: Theta (control input)
+        axes[4, 1].plot(time_points, np.rad2deg(control_traj[:, 1]), 'r-', label='Theta', linewidth=2)
+        axes[4, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        axes[4, 1].set_xlabel('Time (s)')
+        axes[4, 1].set_ylabel('Theta (deg)')
+        axes[4, 1].set_title('Control Input: Theta (Deflection)')
+        axes[4, 1].grid(True)
+        axes[4, 1].legend()
+        
+        # Plot 15: Thrust and Yaw Torque (control input) - dual y-axis
+        ax_thrust = axes[4, 2]
         ax_torque = ax_thrust.twinx()  # Create second y-axis
         
         # Plot thrust on left y-axis
@@ -1185,6 +1522,144 @@ class ControllerComparisonGUI(QMainWindow):
         ref_att_layout.addStretch()
         att_debug_tab_layout.addLayout(ref_att_layout)
         
+        # Debug Mode Selection
+        debug_mode_group = QGroupBox("Debug Mode (Layer-by-Layer Testing)")
+        debug_mode_layout = QVBoxLayout()
+        debug_mode_layout.setContentsMargins(10, 10, 10, 10)
+        
+        mode_select_layout = QHBoxLayout()
+        mode_select_layout.addWidget(QLabel("Debug Mode:"))
+        self.combo_debug_mode = QComboBox()
+        self.combo_debug_mode.addItems(["None (Normal)", "u (Control Input)", "omega (Angular Velocity)", 
+                                         "attitude (Attitude)", "velocity (Velocity)"])
+        self.combo_debug_mode.setCurrentIndex(0)
+        self.combo_debug_mode.currentIndexChanged.connect(self.on_debug_mode_changed)
+        mode_select_layout.addWidget(self.combo_debug_mode)
+        mode_select_layout.addStretch()
+        debug_mode_layout.addLayout(mode_select_layout)
+        
+        # Debug value inputs (initially hidden)
+        self.debug_inputs_widget = QWidget()
+        self.debug_inputs_layout = QVBoxLayout()
+        self.debug_inputs_widget.setLayout(self.debug_inputs_layout)
+        self.debug_inputs_widget.setVisible(False)
+        debug_mode_layout.addWidget(self.debug_inputs_widget)
+        
+        # u (Control Input) inputs
+        self.u_inputs_group = QGroupBox("Control Input [phi, theta, thrust, tau_r]")
+        u_layout = QFormLayout()
+        self.spin_u_phi = QDoubleSpinBox()
+        self.spin_u_phi.setRange(-0.5, 0.5)
+        self.spin_u_phi.setValue(0.0)
+        self.spin_u_phi.setDecimals(4)
+        self.spin_u_phi.setSuffix(" rad")
+        u_layout.addRow("Phi (rad):", self.spin_u_phi)
+        
+        self.spin_u_theta = QDoubleSpinBox()
+        self.spin_u_theta.setRange(-0.5, 0.5)
+        self.spin_u_theta.setValue(0.0)
+        self.spin_u_theta.setDecimals(4)
+        self.spin_u_theta.setSuffix(" rad")
+        u_layout.addRow("Theta (rad):", self.spin_u_theta)
+        
+        self.spin_u_thrust = QDoubleSpinBox()
+        self.spin_u_thrust.setRange(0.0, 20.0)
+        self.spin_u_thrust.setValue(6.45)
+        self.spin_u_thrust.setDecimals(2)
+        self.spin_u_thrust.setSuffix(" N")
+        u_layout.addRow("Thrust (N):", self.spin_u_thrust)
+        
+        self.spin_u_tau_r = QDoubleSpinBox()
+        self.spin_u_tau_r.setRange(-1.0, 1.0)
+        self.spin_u_tau_r.setValue(0.0)
+        self.spin_u_tau_r.setDecimals(4)
+        self.spin_u_tau_r.setSuffix(" Nm")
+        u_layout.addRow("Tau_r (Nm):", self.spin_u_tau_r)
+        self.u_inputs_group.setLayout(u_layout)
+        self.debug_inputs_layout.addWidget(self.u_inputs_group)
+        self.u_inputs_group.setVisible(False)
+        
+        # omega (Angular Velocity) inputs
+        self.omega_inputs_group = QGroupBox("Angular Velocity Command [p, q, r]")
+        omega_layout = QFormLayout()
+        self.spin_omega_p = QDoubleSpinBox()
+        self.spin_omega_p.setRange(-5.0, 5.0)
+        self.spin_omega_p.setValue(0.0)
+        self.spin_omega_p.setDecimals(3)
+        self.spin_omega_p.setSuffix(" rad/s")
+        omega_layout.addRow("P (roll rate, rad/s):", self.spin_omega_p)
+        
+        self.spin_omega_q = QDoubleSpinBox()
+        self.spin_omega_q.setRange(-5.0, 5.0)
+        self.spin_omega_q.setValue(0.0)
+        self.spin_omega_q.setDecimals(3)
+        self.spin_omega_q.setSuffix(" rad/s")
+        omega_layout.addRow("Q (pitch rate, rad/s):", self.spin_omega_q)
+        
+        self.spin_omega_r = QDoubleSpinBox()
+        self.spin_omega_r.setRange(-5.0, 5.0)
+        self.spin_omega_r.setValue(0.0)
+        self.spin_omega_r.setDecimals(3)
+        self.spin_omega_r.setSuffix(" rad/s")
+        omega_layout.addRow("R (yaw rate, rad/s):", self.spin_omega_r)
+        self.omega_inputs_group.setLayout(omega_layout)
+        self.debug_inputs_layout.addWidget(self.omega_inputs_group)
+        self.omega_inputs_group.setVisible(False)
+        
+        # attitude (Attitude) inputs
+        self.attitude_inputs_group = QGroupBox("Attitude Command [qx, qy, qz] (quaternion vector)")
+        attitude_layout = QFormLayout()
+        self.spin_att_qx = QDoubleSpinBox()
+        self.spin_att_qx.setRange(-0.5, 0.5)
+        self.spin_att_qx.setValue(0.0)
+        self.spin_att_qx.setDecimals(4)
+        attitude_layout.addRow("qx (roll component):", self.spin_att_qx)
+        
+        self.spin_att_qy = QDoubleSpinBox()
+        self.spin_att_qy.setRange(-0.5, 0.5)
+        self.spin_att_qy.setValue(0.0)
+        self.spin_att_qy.setDecimals(4)
+        attitude_layout.addRow("qy (pitch component):", self.spin_att_qy)
+        
+        self.spin_att_qz = QDoubleSpinBox()
+        self.spin_att_qz.setRange(-0.5, 0.5)
+        self.spin_att_qz.setValue(0.0)
+        self.spin_att_qz.setDecimals(4)
+        attitude_layout.addRow("qz (yaw component):", self.spin_att_qz)
+        self.attitude_inputs_group.setLayout(attitude_layout)
+        self.debug_inputs_layout.addWidget(self.attitude_inputs_group)
+        self.attitude_inputs_group.setVisible(False)
+        
+        # velocity (Velocity) inputs
+        self.velocity_inputs_group = QGroupBox("Velocity Command [vx, vy, vz]")
+        velocity_layout = QFormLayout()
+        self.spin_vel_vx = QDoubleSpinBox()
+        self.spin_vel_vx.setRange(-10.0, 10.0)
+        self.spin_vel_vx.setValue(0.0)
+        self.spin_vel_vx.setDecimals(2)
+        self.spin_vel_vx.setSuffix(" m/s")
+        velocity_layout.addRow("Vx (East, m/s):", self.spin_vel_vx)
+        
+        self.spin_vel_vy = QDoubleSpinBox()
+        self.spin_vel_vy.setRange(-10.0, 10.0)
+        self.spin_vel_vy.setValue(0.0)
+        self.spin_vel_vy.setDecimals(2)
+        self.spin_vel_vy.setSuffix(" m/s")
+        velocity_layout.addRow("Vy (North, m/s):", self.spin_vel_vy)
+        
+        self.spin_vel_vz = QDoubleSpinBox()
+        self.spin_vel_vz.setRange(-10.0, 10.0)
+        self.spin_vel_vz.setValue(0.0)
+        self.spin_vel_vz.setDecimals(2)
+        self.spin_vel_vz.setSuffix(" m/s")
+        velocity_layout.addRow("Vz (Up, m/s):", self.spin_vel_vz)
+        self.velocity_inputs_group.setLayout(velocity_layout)
+        self.debug_inputs_layout.addWidget(self.velocity_inputs_group)
+        self.velocity_inputs_group.setVisible(False)
+        
+        debug_mode_group.setLayout(debug_mode_layout)
+        att_debug_tab_layout.addWidget(debug_mode_group)
+        
         att_debug_tab_layout.addStretch()
         self.controller_params_tabs.addTab(att_debug_tab, "Attitude Debug")
         
@@ -1444,6 +1919,28 @@ class ControllerComparisonGUI(QMainWindow):
         self.log_status(f"Error: {error_msg}")
         QMessageBox.critical(self, "Simulation Error", f"An error occurred:\n{error_msg}")
     
+    def on_debug_mode_changed(self, index):
+        """Handle debug mode selection change"""
+        # Hide all input groups
+        self.u_inputs_group.setVisible(False)
+        self.omega_inputs_group.setVisible(False)
+        self.attitude_inputs_group.setVisible(False)
+        self.velocity_inputs_group.setVisible(False)
+        
+        # Show debug inputs widget if not "None"
+        if index == 0:  # None
+            self.debug_inputs_widget.setVisible(False)
+        else:
+            self.debug_inputs_widget.setVisible(True)
+            if index == 1:  # u (Control Input)
+                self.u_inputs_group.setVisible(True)
+            elif index == 2:  # omega (Angular Velocity)
+                self.omega_inputs_group.setVisible(True)
+            elif index == 3:  # attitude (Attitude)
+                self.attitude_inputs_group.setVisible(True)
+            elif index == 4:  # velocity (Velocity)
+                self.velocity_inputs_group.setVisible(True)
+    
     def run_attitude_debug(self):
         """Run attitude control debug simulation"""
         # Get attitude parameters
@@ -1482,6 +1979,42 @@ class ControllerComparisonGUI(QMainWindow):
             if hasattr(self, 'spin_max_angular_velocity'):
                 pid_gains['max_angular_velocity_deg_s'] = self.spin_max_angular_velocity.value()
         
+        # Create debug config based on selected mode
+        debug_config = None
+        if DebugConfig is not None:
+            debug_mode_index = self.combo_debug_mode.currentIndex()
+            if debug_mode_index == 1:  # u (Control Input)
+                u_value = np.array([
+                    self.spin_u_phi.value(),
+                    self.spin_u_theta.value(),
+                    self.spin_u_thrust.value(),
+                    self.spin_u_tau_r.value()
+                ])
+                debug_config = DebugConfig.create_u_debug(u_value)
+            elif debug_mode_index == 2:  # omega (Angular Velocity)
+                omega_value = np.array([
+                    self.spin_omega_p.value(),
+                    self.spin_omega_q.value(),
+                    self.spin_omega_r.value()
+                ])
+                debug_config = DebugConfig.create_omega_debug(omega_value)
+            elif debug_mode_index == 3:  # attitude (Attitude)
+                attitude_value = np.array([
+                    self.spin_att_qx.value(),
+                    self.spin_att_qy.value(),
+                    self.spin_att_qz.value()
+                ])
+                debug_config = DebugConfig.create_attitude_debug(attitude_value)
+            elif debug_mode_index == 4:  # velocity (Velocity)
+                velocity_value = np.array([
+                    self.spin_vel_vx.value(),
+                    self.spin_vel_vy.value(),
+                    self.spin_vel_vz.value()
+                ])
+                debug_config = DebugConfig.create_velocity_debug(velocity_value)
+            else:  # None
+                debug_config = DebugConfig(mode='none')
+        
         # Disable button and show progress
         self.btn_run_att_debug.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -1490,10 +2023,12 @@ class ControllerComparisonGUI(QMainWindow):
                        f"Pitch={self.spin_pitch0.value():.1f}°, Yaw={self.spin_yaw0.value():.1f}°")
         self.log_status(f"Reference: Roll={self.spin_roll_ref.value():.1f}°, "
                        f"Pitch={self.spin_pitch_ref.value():.1f}°, Yaw={self.spin_yaw_ref.value():.1f}°")
+        if debug_config and debug_config.mode != 'none':
+            self.log_status(f"Debug Mode: {debug_config.mode}")
         
         # Create and start worker thread
         self.att_debug_worker = AttitudeDebugWorker(
-            self.simulator.params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains
+            self.simulator.params, att_init_euler, att_ref_euler, sim_time, dt, pid_gains, debug_config
         )
         self.att_debug_worker.progress.connect(self.log_status)
         self.att_debug_worker.finished.connect(self.on_attitude_debug_finished)
@@ -1589,6 +2124,20 @@ class ControllerComparisonGUI(QMainWindow):
             
             # Attitude debug parameters
             params['attitude_debug'] = {
+                'debug_mode': self.combo_debug_mode.currentIndex(),
+                'u_phi': self.spin_u_phi.value(),
+                'u_theta': self.spin_u_theta.value(),
+                'u_thrust': self.spin_u_thrust.value(),
+                'u_tau_r': self.spin_u_tau_r.value(),
+                'omega_p': self.spin_omega_p.value(),
+                'omega_q': self.spin_omega_q.value(),
+                'omega_r': self.spin_omega_r.value(),
+                'att_qx': self.spin_att_qx.value(),
+                'att_qy': self.spin_att_qy.value(),
+                'att_qz': self.spin_att_qz.value(),
+                'vel_vx': self.spin_vel_vx.value(),
+                'vel_vy': self.spin_vel_vy.value(),
+                'vel_vz': self.spin_vel_vz.value(),
                 'initial': {
                     'roll': self.spin_roll0.value(),
                     'pitch': self.spin_pitch0.value(),
@@ -1726,6 +2275,36 @@ class ControllerComparisonGUI(QMainWindow):
                         self.spin_pitch_ref.setValue(ref['pitch'])
                     if 'yaw' in ref:
                         self.spin_yaw_ref.setValue(ref['yaw'])
+                # Load debug mode settings
+                if 'debug_mode' in att_debug:
+                    self.combo_debug_mode.setCurrentIndex(att_debug['debug_mode'])
+                    self.on_debug_mode_changed(att_debug['debug_mode'])
+                if 'u_phi' in att_debug:
+                    self.spin_u_phi.setValue(att_debug['u_phi'])
+                if 'u_theta' in att_debug:
+                    self.spin_u_theta.setValue(att_debug['u_theta'])
+                if 'u_thrust' in att_debug:
+                    self.spin_u_thrust.setValue(att_debug['u_thrust'])
+                if 'u_tau_r' in att_debug:
+                    self.spin_u_tau_r.setValue(att_debug['u_tau_r'])
+                if 'omega_p' in att_debug:
+                    self.spin_omega_p.setValue(att_debug['omega_p'])
+                if 'omega_q' in att_debug:
+                    self.spin_omega_q.setValue(att_debug['omega_q'])
+                if 'omega_r' in att_debug:
+                    self.spin_omega_r.setValue(att_debug['omega_r'])
+                if 'att_qx' in att_debug:
+                    self.spin_att_qx.setValue(att_debug['att_qx'])
+                if 'att_qy' in att_debug:
+                    self.spin_att_qy.setValue(att_debug['att_qy'])
+                if 'att_qz' in att_debug:
+                    self.spin_att_qz.setValue(att_debug['att_qz'])
+                if 'vel_vx' in att_debug:
+                    self.spin_vel_vx.setValue(att_debug['vel_vx'])
+                if 'vel_vy' in att_debug:
+                    self.spin_vel_vy.setValue(att_debug['vel_vy'])
+                if 'vel_vz' in att_debug:
+                    self.spin_vel_vz.setValue(att_debug['vel_vz'])
             
             # Load PID parameters
             if 'pid' in params and hasattr(self, 'pid_Kp_pos'):

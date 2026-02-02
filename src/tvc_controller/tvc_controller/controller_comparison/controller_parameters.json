@@ -1,6 +1,6 @@
 {
     "simulation": {
-        "t_end": 10.0,
+        "t_end": 5.0,
         "dt": 0.01
     },
     "states": {
@@ -10,20 +10,34 @@
             "z": 0.0
         },
         "reference": {
-            "x": 0.1,
-            "y": 0.0,
+            "x": 1.0,
+            "y": 2.0,
             "z": 1.0
         }
     },
     "attitude_debug": {
+        "debug_mode": 4,
+        "u_phi": 0.0,
+        "u_theta": 0.0,
+        "u_thrust": 6.45,
+        "u_tau_r": 0.0,
+        "omega_p": 0.0,
+        "omega_q": 0.0,
+        "omega_r": 0.0,
+        "att_qx": 0.0,
+        "att_qy": 0.0,
+        "att_qz": 0.0,
+        "vel_vx": 0.0,
+        "vel_vy": 0.0,
+        "vel_vz": 0.0,
         "initial": {
             "roll": 0.0,
             "pitch": 0.0,
             "yaw": 0.0
         },
         "reference": {
-            "roll": 10.0,
-            "pitch": 10.0,
+            "roll": 0.0,
+            "pitch": 0.0,
             "yaw": 0.0
         }
     },
@@ -31,12 +45,12 @@
         "Kp_pos": [
             1.0,
             1.0,
-            10.0
+            2.0
         ],
         "Kp_vel": [
-            1.0,
-            1.0,
-            1.0
+            2.0,
+            2.0,
+            2.0
         ],
         "Ki_vel": [
             0.0,
@@ -49,13 +63,13 @@
             0.0
         ],
         "Kp_att": [
-            2.0,
-            2.0,
-            0.5
+            10.0,
+            10.0,
+            1.0
         ],
         "Kp_omega": [
-            1.0,
-            1.0,
+            2.0,
+            2.0,
             1.0
         ],
         "Ki_omega": [
@@ -69,7 +83,7 @@
             0.0
         ],
         "max_deflection_angle_deg": 15.0,
-        "max_angular_velocity_deg_s": 10.0
+        "max_angular_velocity_deg_s": 30.0
     },
     "lqr_full": {
         "Q": [

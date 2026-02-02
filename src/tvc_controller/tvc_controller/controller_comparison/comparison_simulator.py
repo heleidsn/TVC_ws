@@ -27,12 +27,20 @@ if __name__ == "__main__" or __package__ is None:
     from controller_comparison.lqr_full_state import LQRFullStateController
     from controller_comparison.lqr_attitude_only import LQRAttitudeOnlyController
     from controller_comparison.pid_controller import PIDController
+    try:
+        from controller_comparison.debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 else:
     # Running as module
     from .rocket_dynamics import RocketDynamics, PhyParams
     from .lqr_full_state import LQRFullStateController
     from .lqr_attitude_only import LQRAttitudeOnlyController
     from .pid_controller import PIDController
+    try:
+        from .debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 
 
 def quaternion_to_euler(q_vec: np.ndarray) -> np.ndarray:
@@ -108,7 +116,7 @@ class ComparisonSimulator:
     
     def simulate(self, controller_name: str, state0: np.ndarray, 
                  state_ref: np.ndarray, t_end: float,
-                 apply_constraints: bool = True) -> SimulationResult:
+                 apply_constraints: bool = True, debug_config: Optional[DebugConfig] = None) -> SimulationResult:
         """
         Run simulation with specified controller.
         
@@ -118,6 +126,7 @@ class ComparisonSimulator:
             state_ref: Reference state (12D) - can be constant or time-varying
             t_end: Simulation end time (s)
             apply_constraints: Whether to apply control input constraints
+            debug_config: Debug configuration for layer-by-layer testing (only works with 'pid' controller)
             
         Returns:
             SimulationResult object
@@ -190,26 +199,33 @@ class ComparisonSimulator:
             
             # Compute control
             if controller_name == 'pid':
-                if record_desired:
-                    u, debug_info = controller.compute_control(state, state_ref_current, self.dt, return_debug=True)
+                if record_desired or debug_config:
+                    u, debug_info = controller.compute_control(
+                        state, state_ref_current, self.dt, 
+                        return_debug=True, debug_config=debug_config, t=time[i]
+                    )
                     # Store desired values from controller layers:
                     # Position: user-specified (not controller output, so no desired to show)
                     # Velocity: vel_cmd (from position controller P-only output)
                     # Attitude: att_ref_total (from velocity controller output)
                     # Angular velocity: omega_ref_total (from attitude controller output)
-                    desired_traj[i, 0:3] = np.nan  # Position desired is user-specified, not controller output
-                    desired_traj[i, 3:6] = debug_info['vel_cmd']  # Desired velocity from position controller
-                    # Convert att_ref_total to Euler for display
-                    from scipy.spatial.transform import Rotation
-                    att_ref_total = debug_info['att_ref_total']
-                    qw = np.sqrt(np.clip(1.0 - np.sum(att_ref_total**2), 0.0, 1.0))
-                    q = np.array([qw, att_ref_total[0], att_ref_total[1], att_ref_total[2]])
-                    rot = Rotation.from_quat([q[1], q[2], q[3], q[0]])
-                    euler = rot.as_euler('ZYX', degrees=False)  # [yaw, pitch, roll]
-                    desired_traj[i, 6:9] = np.array([euler[2], euler[1], euler[0]])  # [roll, pitch, yaw]
-                    desired_traj[i, 9:12] = debug_info['omega_ref_total']  # Desired angular velocity (already in rad/s)
+                    if record_desired:
+                        desired_traj[i, 0:3] = np.nan  # Position desired is user-specified, not controller output
+                        if 'vel_cmd' in debug_info:
+                            desired_traj[i, 3:6] = debug_info['vel_cmd']  # Desired velocity from position controller
+                        # Convert att_ref_total to Euler for display
+                        from scipy.spatial.transform import Rotation
+                        if 'att_ref_total' in debug_info:
+                            att_ref_total = debug_info['att_ref_total']
+                            qw = np.sqrt(np.clip(1.0 - np.sum(att_ref_total**2), 0.0, 1.0))
+                            q = np.array([qw, att_ref_total[0], att_ref_total[1], att_ref_total[2]])
+                            rot = Rotation.from_quat([q[1], q[2], q[3], q[0]])
+                            euler = rot.as_euler('ZYX', degrees=False)  # [yaw, pitch, roll]
+                            desired_traj[i, 6:9] = np.array([euler[2], euler[1], euler[0]])  # [roll, pitch, yaw]
+                        if 'omega_ref_total' in debug_info:
+                            desired_traj[i, 9:12] = debug_info['omega_ref_total']  # Desired angular velocity (already in rad/s)
                 else:
-                    u = controller.compute_control(state, state_ref_current, self.dt)
+                    u = controller.compute_control(state, state_ref_current, self.dt, debug_config=debug_config, t=time[i])
             else:
                 u = controller.compute_control(state, state_ref_current)
             

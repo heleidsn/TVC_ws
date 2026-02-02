@@ -11,7 +11,7 @@ This strapdown architecture allows each part to work independently or together.
 """
 
 import numpy as np
-from typing import Optional, Tuple, Dict, Union
+from typing import Optional, Tuple, Dict, Union, Callable
 import sys
 import os
 
@@ -19,8 +19,16 @@ import os
 if __name__ == "__main__" or __package__ is None:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from controller_comparison.rocket_dynamics import PhyParams
+    try:
+        from controller_comparison.debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 else:
     from .rocket_dynamics import PhyParams
+    try:
+        from .debug_config import DebugConfig
+    except ImportError:
+        DebugConfig = None
 
 
 class PositionControl:
@@ -111,14 +119,15 @@ class PositionControl:
         vel_cmd_xy_limited = np.clip(vel_cmd_xy, -max_vel_cmd_xy, max_vel_cmd_xy)
         
         # Convert to attitude command for horizontal control
-        # Based on dynamics: phi affects vx (X-accel, B[3,0]=-g), theta affects vy (Y-accel, B[4,1]=g)
-        # In attitude control: qx -> u_omega[0] -> phi, qy -> u_omega[1] -> theta
-        # Correct mapping: vx -> qx -> phi, vy -> qy -> theta
-        # For positive vx: need phi < 0, so qx < 0, so qx = -vx/G
-        # For positive vy: need theta > 0, so qy > 0, so qy = vy/G
+        # Based on dynamics: A[3,7] = -2g (vx_dot ≈ -2g * qy), A[4,6] = 2g (vy_dot ≈ 2g * qx)
+        # vx (X-velocity) is affected by pitch (qy): vx_dot ≈ -2g * qy
+        # vy (Y-velocity) is affected by roll (qx): vy_dot ≈ 2g * qx
+        # Correct mapping: vx error -> pitch (qy), vy error -> roll (qx)
+        # For positive vx error: need qy > 0 (pitch up), so qy = vx / (2g)
+        # For positive vy error: need qx < 0 (roll left), so qx = -vy / (2g)
         att_cmd_xy = np.array([
-            -vel_cmd_xy_limited[0] / self.params.G,  # qx (roll) from vx -> phi (affects vx)
-            vel_cmd_xy_limited[1] / self.params.G,   # qy (pitch) from vy -> theta (affects vy)
+            -vel_cmd_xy_limited[1] / (2 * self.params.G),   # qx (roll) from vy error
+            vel_cmd_xy_limited[0] / (2 * self.params.G),  # qy (pitch) from vx error
             0.0  # qz (yaw)
         ])
         
@@ -143,8 +152,8 @@ class PositionControl:
         
         # Store attitude command before limiting for debugging
         att_cmd_xy_before_limit = np.array([
-            -vel_cmd_xy_limited[0] / self.params.G,  # qx (roll) from vx -> phi
-            vel_cmd_xy_limited[1] / self.params.G,   # qy (pitch) from vy -> theta
+            -vel_cmd_xy_limited[1] / (2 * self.params.G),   # qx (roll) from vy error
+            vel_cmd_xy_limited[0] / (2 * self.params.G),  # qy (pitch) from vx error
             0.0  # qz (yaw)
         ])
         
@@ -304,7 +313,9 @@ class PIDController:
         self.position_control.reset()
         self.attitude_control.reset()
     
-    def compute_control(self, state: np.ndarray, state_ref: np.ndarray, dt: float, return_debug: bool = False) -> Tuple[np.ndarray, Optional[dict]]:
+    def compute_control(self, state: np.ndarray, state_ref: np.ndarray, dt: float, 
+                        return_debug: bool = False, debug_config: Optional[DebugConfig] = None,
+                        t: float = 0.0) -> Tuple[np.ndarray, Optional[dict]]:
         """
         Compute control input using strapdown PID control law.
         
@@ -313,6 +324,8 @@ class PIDController:
             state_ref: Reference state
             dt: Time step (s)
             return_debug: If True, return debug information with intermediate values
+            debug_config: Debug configuration for layer-by-layer testing
+            t: Current time (s), used for time-varying debug values
             
         Returns:
             If return_debug=False: Control input [phi, theta, thrust, tau_r]
@@ -320,6 +333,13 @@ class PIDController:
                 - control_input: [phi, theta, thrust, tau_r]
                 - debug_dict: Dictionary with intermediate values
         """
+        # Check for direct control input injection (layer 1: u)
+        if debug_config and debug_config.mode == 'u':
+            u_debug = debug_config.get_value('u', t, state)
+            if u_debug is not None:
+                if return_debug:
+                    return u_debug, {'debug_mode': 'u', 'debug_value': u_debug}
+                return u_debug
         # Extract state components
         pos = state[0:3]
         vel = state[3:6]
@@ -332,10 +352,69 @@ class PIDController:
         att_ref = state_ref[6:9]
         omega_ref = state_ref[9:12]
         
+        # Check for velocity command injection (layer 4: velocity)
+        vel_cmd_debug = None
+        if debug_config and debug_config.mode == 'velocity':
+            vel_cmd_debug = debug_config.get_value('velocity', t, state)
+        
         # Strapdown Position Control
-        att_cmd_xy, thrust_cmd, vel_cmd_total, vel_cmd, att_cmd_xy_before_limit = self.position_control.compute(
-            pos, vel, pos_ref, vel_ref, dt
-        )
+        if vel_cmd_debug is not None:
+            # Use debug velocity command, skip position control
+            vel_cmd = vel_cmd_debug
+            vel_cmd_total = vel_ref + vel_cmd
+            
+            # Compute velocity error (this is the key: use error, not command directly)
+            error_vel_total = vel_cmd_total - vel
+            
+            # Apply PID control to velocity error (same as normal position control)
+            # Update velocity integral
+            self.position_control.integral_vel += error_vel_total * dt
+            
+            # Compute velocity derivative
+            if dt > 0 and self.position_control.prev_time is not None:
+                deriv_error_vel = (error_vel_total - self.position_control.prev_error_vel) / dt
+            else:
+                deriv_error_vel = np.zeros(3)
+            
+            # Velocity PID for horizontal control
+            vel_cmd_xy = (self.position_control.Kp_vel[0:2] * error_vel_total[0:2] + 
+                          self.position_control.Ki_vel[0:2] * self.position_control.integral_vel[0:2] + 
+                          self.position_control.Kd_vel[0:2] * deriv_error_vel[0:2])
+            
+            # Limit horizontal velocity command
+            max_vel_cmd_xy = 3.0  # m/s
+            vel_cmd_xy_limited = np.clip(vel_cmd_xy, -max_vel_cmd_xy, max_vel_cmd_xy)
+            
+            # Convert velocity error (after PID) to attitude command
+            # vx error -> pitch (qy), vy error -> roll (qx)
+            att_cmd_xy = np.array([
+                -vel_cmd_xy_limited[1] / (2 * self.params.G),   # qx (roll) from vy error
+                vel_cmd_xy_limited[0] / (2 * self.params.G),  # qy (pitch) from vx error
+                0.0  # qz (yaw)
+            ])
+            att_cmd_xy = np.clip(att_cmd_xy, -self.max_deflection_angle, self.max_deflection_angle)
+            
+            # Store attitude command before limiting for debugging
+            att_cmd_xy_before_limit = np.array([
+                -vel_cmd_xy_limited[1] / (2 * self.params.G),   # qx (roll) from vy error
+                vel_cmd_xy_limited[0] / (2 * self.params.G),  # qy (pitch) from vx error
+                0.0  # qz (yaw)
+            ])
+            
+            # Use equilibrium thrust for velocity debug mode
+            thrust_cmd = self.params.MASS * self.params.G
+            
+            # Update previous errors for next iteration
+            self.position_control.prev_error_vel = error_vel_total
+            self.position_control.prev_time = dt
+            
+            # Store debug mode info for return
+            debug_mode_velocity = True
+        else:
+            att_cmd_xy, thrust_cmd, vel_cmd_total, vel_cmd, att_cmd_xy_before_limit = self.position_control.compute(
+                pos, vel, pos_ref, vel_ref, dt
+            )
+            debug_mode_velocity = False
         
         # Combine attitude reference: base reference + horizontal control command
         att_ref_total = att_ref + att_cmd_xy
@@ -368,9 +447,74 @@ class PIDController:
         if q_norm < 0.1:  # If quaternion becomes too large, renormalize
             att_ref_total = att_ref_total * 0.9 / np.linalg.norm(att_ref_total) if np.linalg.norm(att_ref_total) > 0 else att_ref
         
-        u_omega, tau_r, omega_cmd, omega_ref_total = self.attitude_control.compute(
-            att, omega, att_ref_total, omega_ref, dt
-        )
+        # Check for attitude command injection (layer 3: attitude)
+        att_ref_debug = None
+        if debug_config and debug_config.mode == 'attitude':
+            att_ref_debug = debug_config.get_value('attitude', t, state)
+            if att_ref_debug is not None:
+                att_ref_total = att_ref_debug
+                # Continue with attitude control using debug attitude reference
+        
+        # Check for angular velocity command injection (layer 2: omega)
+        omega_ref_debug = None
+        if debug_config and debug_config.mode == 'omega':
+            omega_ref_debug = debug_config.get_value('omega', t, state)
+            if omega_ref_debug is not None:
+                # Use debug omega as reference, skip attitude control
+                omega_ref_total = omega_ref_debug
+                omega_cmd = omega_ref_total - omega_ref
+                # Compute angular velocity error and use PID
+                error_omega = omega_ref_total - omega
+                # Update integral
+                self.attitude_control.integral_omega += error_omega * dt
+                # Compute derivative
+                if dt > 0 and self.attitude_control.prev_time is not None:
+                    deriv_error_omega = (error_omega - self.attitude_control.prev_error_omega) / dt
+                else:
+                    deriv_error_omega = np.zeros(3)
+                # Angular velocity PID
+                u_omega = (self.attitude_control.Kp_omega * error_omega + 
+                          self.attitude_control.Ki_omega * self.attitude_control.integral_omega + 
+                          self.attitude_control.Kd_omega * deriv_error_omega)
+                # Limit angular velocity control output
+                max_u_omega = 2.0  # rad/s
+                u_omega = np.clip(u_omega, -max_u_omega, max_u_omega)
+                # Map to control inputs
+                scale_factor = 0.2  # Scale factor: rad deflection per rad/s control
+                phi = -u_omega[0] * scale_factor  # phi from roll rate control (p)
+                theta = -u_omega[1] * scale_factor  # theta from pitch rate control (q)
+                # Limit deflection angles
+                phi = np.clip(phi, -self.max_deflection_angle, self.max_deflection_angle)
+                theta = np.clip(theta, -self.max_deflection_angle, self.max_deflection_angle)
+                # Yaw torque from r component
+                tau_r = u_omega[2] * self.params.I_ZZ
+                # Store for next iteration
+                self.attitude_control.prev_error_omega = error_omega
+                self.attitude_control.prev_time = dt
+                # Create control input
+                u = np.array([phi, theta, thrust_cmd, tau_r])
+                if return_debug:
+                    debug_info = {
+                        'vel_cmd': vel_cmd if 'vel_cmd' in locals() else np.zeros(3),
+                        'vel_cmd_total': vel_cmd_total if 'vel_cmd_total' in locals() else vel_ref,
+                        'att_cmd_xy': att_cmd_xy if 'att_cmd_xy' in locals() else np.zeros(3),
+                        'att_ref_total': att_ref_total,
+                        'omega_cmd': omega_cmd,
+                        'omega_ref_total': omega_ref_total,
+                        'debug_mode': 'omega',
+                        'debug_value': omega_ref_debug
+                    }
+                    return u, debug_info
+                else:
+                    return u
+            else:
+                u_omega, tau_r, omega_cmd, omega_ref_total = self.attitude_control.compute(
+                    att, omega, att_ref_total, omega_ref, dt
+                )
+        else:
+            u_omega, tau_r, omega_cmd, omega_ref_total = self.attitude_control.compute(
+                att, omega, att_ref_total, omega_ref, dt
+            )
         
         # Map to control inputs - use the same logic as compute_attitude_control_only
         # This directly maps angular velocity control output to deflection angles
@@ -394,6 +538,12 @@ class PIDController:
                 'omega_cmd': omega_cmd,  # Desired angular velocity from attitude error
                 'omega_ref_total': omega_ref_total  # Total desired angular velocity
             }
+            if debug_mode_velocity:
+                debug_info['debug_mode'] = 'velocity'
+                debug_info['debug_value'] = vel_cmd_debug
+            elif debug_config and debug_config.mode == 'attitude':
+                debug_info['debug_mode'] = 'attitude'
+                debug_info['debug_value'] = att_ref_debug
             return u, debug_info
         else:
             return u
@@ -481,7 +631,7 @@ class PIDController:
         omega_ref = np.zeros(3)
         
         # Use strapdown attitude control
-        u_omega, tau_r = self.attitude_control.compute(att, omega, att_ref, omega_ref, dt)
+        u_omega, tau_r, omega_cmd, omega_ref_total = self.attitude_control.compute(att, omega, att_ref, omega_ref, dt)
         
         # For attitude-only control, use equilibrium thrust (hover)
         thrust_cmd = self.params.MASS * self.params.G
