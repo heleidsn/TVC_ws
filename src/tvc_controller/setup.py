@@ -35,6 +35,7 @@ setup(
             'auto_takeoff_land = tvc_controller.px4_simple_trajectory:main',
             'px4_rviz_bridge = tvc_controller.px4_rviz_bridge:main',
             'gz_vision_publisher = tvc_controller.gz_vision_publisher:main',
+            'tvc_traj_player = tvc_controller.tvc_traj_player:main',
         ],
     },
 )
