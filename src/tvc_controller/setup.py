@@ -16,9 +16,12 @@ setup(
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
         # Include config files - ADD THIS LINE
-        (os.path.join('share', package_name, 'config'), 
+        (os.path.join('share', package_name, 'config'),
             glob(os.path.join('config', '*.yaml')) +
-            glob(os.path.join('config', '*.rviz'))),
+            glob(os.path.join('config', '*.rviz')) +
+            glob(os.path.join('config', 'bridge.yaml'))),
+        (os.path.join('share', package_name, 'models', 'tvc'),
+            glob(os.path.join('models', 'tvc', '*.urdf'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

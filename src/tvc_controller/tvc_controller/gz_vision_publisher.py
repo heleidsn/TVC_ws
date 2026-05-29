@@ -8,9 +8,9 @@ converts to PX4 NED / body FRD (px4_msgs/VehicleOdometry), and publishes to
 
 Frame conversion matches PX4 GZBridge::odometryCallback().
 
-Note: OdometryPublisher reports pose in the model ``odom`` frame (relative to
-spawn), NOT absolute Gazebo world coordinates. At rest on the pad the position
-is expected to be (0, 0, 0); it changes when the vehicle moves.
+Timestamps are taken from the odometry ``header.stamp`` (simulation time when
+``use_sim_time`` is enabled) so EKF2 can align vision with IMU samples. If the
+header stamp is zero, the node clock is used as a fallback.
 """
 
 import math
@@ -57,7 +57,7 @@ class GzVisionPublisher(Node):
         super().__init__('gz_vision_publisher')
 
         self.declare_parameter('px4_namespace', '')
-        self.declare_parameter('gz_odometry_topic', '/model/tvc_0/odometry_with_covariance')
+        self.declare_parameter('gz_odometry_topic', '/model/tvc_0/odometry')
         self.declare_parameter('position_variance', 0.01)
         self.declare_parameter('orientation_variance', 0.01)
         self.declare_parameter('velocity_variance', 0.01)
@@ -97,7 +97,11 @@ class GzVisionPublisher(Node):
             f'(odom-relative ENU -> PX4 local NED)'
         )
 
-    def _now_us(self) -> int:
+    def _stamp_us_from_header(self, msg: Odometry) -> int:
+        """Return odometry measurement time in microseconds (PX4 format)."""
+        stamp = msg.header.stamp
+        if stamp.sec > 0 or stamp.nanosec > 0:
+            return int(stamp.sec * 1_000_000 + stamp.nanosec // 1000)
         return int(self.get_clock().now().nanoseconds // 1000)
 
     def _on_gz_odometry(self, msg: Odometry) -> None:
@@ -122,9 +126,9 @@ class GzVisionPublisher(Node):
         q_wxyz = flu_enu_to_frd_ned_quat(q_flu_enu)
 
         out = VehicleOdometry()
-        stamp_us = self._now_us()
-        out.timestamp = stamp_us
+        stamp_us = self._stamp_us_from_header(msg)
         out.timestamp_sample = stamp_us
+        out.timestamp = int(self.get_clock().now().nanoseconds // 1000)
 
         out.pose_frame = VehicleOdometry.POSE_FRAME_NED
         out.position = [float(p_ned[0]), float(p_ned[1]), float(p_ned[2])]
@@ -159,11 +163,11 @@ class GzVisionPublisher(Node):
         self._pub_visual_odom.publish(out)
 
         self._debug_counter += 1
-        if self._debug_counter % 50 == 0:
-            self.get_logger().info(
-                f'gz odom ENU [{p_enu[0]:.3f}, {p_enu[1]:.3f}, {p_enu[2]:.3f}] -> '
-                f'vision NED [{p_ned[0]:.3f}, {p_ned[1]:.3f}, {p_ned[2]:.3f}]'
-            )
+        # if self._debug_counter % 50 == 0:
+        #     self.get_logger().info(
+        #         f'gz odom ENU [{p_enu[0]:.3f}, {p_enu[1]:.3f}, {p_enu[2]:.3f}] -> '
+        #         f'vision NED [{p_ned[0]:.3f}, {p_ned[1]:.3f}, {p_ned[2]:.3f}]'
+        #     )
 
 
 def main(args: Optional[List[str]] = None) -> None:

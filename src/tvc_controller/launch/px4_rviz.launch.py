@@ -10,10 +10,24 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _load_robot_description(package_dir: str) -> str:
+    candidates = [
+        os.path.join(package_dir, 'models', 'tvc', 'tvc.urdf'),
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', 'models', 'tvc', 'tvc.urdf')),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            with open(path, 'r', encoding='utf-8') as urdf_file:
+                return urdf_file.read()
+    raise FileNotFoundError('tvc.urdf not found in package share or source tree')
+
+
 def generate_launch_description() -> LaunchDescription:
     package_name = 'tvc_controller'
     package_dir = get_package_share_directory(package_name)
     default_rviz_config = os.path.join(package_dir, 'config', 'px4_rviz.rviz')
+    robot_description = _load_robot_description(package_dir)
 
     px4_namespace_arg = DeclareLaunchArgument(
         'px4_namespace',
@@ -21,8 +35,8 @@ def generate_launch_description() -> LaunchDescription:
         description='PX4 topic namespace prefix (e.g. "/px4_1"). Empty for default single vehicle.',
     )
     world_frame_arg = DeclareLaunchArgument(
-        'world_frame', default_value='map',
-        description='ROS world frame id (ENU).',
+        'world_frame', default_value='world',
+        description='ROS world frame id (ENU, matches Gazebo world).',
     )
     body_frame_arg = DeclareLaunchArgument(
         'body_frame', default_value='base_link',
@@ -30,7 +44,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     publish_tf_arg = DeclareLaunchArgument(
         'publish_tf', default_value='true',
-        description='Whether the bridge should broadcast map -> base_link TF.',
+        description='Whether the bridge should broadcast world -> base_link TF.',
     )
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
@@ -46,13 +60,17 @@ def generate_launch_description() -> LaunchDescription:
     )
     gz_odometry_topic_arg = DeclareLaunchArgument(
         'gz_odometry_topic',
-        default_value='/model/tvc_0/odometry_with_covariance',
+        default_value='/model/tvc_0/odometry',
         description='Gazebo ground-truth odometry topic (ENU). Empty string disables.',
     )
     launch_gz_vision_arg = DeclareLaunchArgument(
         'launch_gz_vision',
         default_value='true',
         description='Publish Gazebo odometry to PX4 vehicle_visual_odometry.',
+    )
+    launch_robot_model_arg = DeclareLaunchArgument(
+        'launch_robot_model', default_value='true',
+        description='Start robot_state_publisher for RViz RobotModel display.',
     )
 
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -97,6 +115,19 @@ def generate_launch_description() -> LaunchDescription:
         condition=IfCondition(LaunchConfiguration('launch_gz_vision')),
     )
 
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description,
+            'use_sim_time': use_sim_time,
+        }],
+        remappings=[('/joint_states', '/tvc/joint_state')],
+        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
+    )
+
     return LaunchDescription([
         px4_namespace_arg,
         world_frame_arg,
@@ -107,7 +138,9 @@ def generate_launch_description() -> LaunchDescription:
         rviz_config_arg,
         gz_odometry_topic_arg,
         launch_gz_vision_arg,
+        launch_robot_model_arg,
         bridge_node,
         gz_vision_node,
+        robot_state_publisher_node,
         rviz_node,
     ])

@@ -14,7 +14,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     gz_odometry_topic_arg = DeclareLaunchArgument(
         'gz_odometry_topic',
-        default_value='/model/tvc_0/odometry_with_covariance',
+        default_value='/model/tvc_0/odometry',
         description='Gazebo ground-truth odometry topic (ENU).',
     )
     use_sim_time_arg = DeclareLaunchArgument(

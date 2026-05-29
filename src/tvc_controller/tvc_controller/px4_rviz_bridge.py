@@ -24,9 +24,13 @@ and republishes them as standard ROS 2 messages that RViz2 understands:
     /px4_visualizer/home_pose               geometry_msgs/PoseStamped  home_position
     /px4_visualizer/gps_fix                 sensor_msgs/NavSatFix      vehicle_global_position
     /px4_visualizer/velocity_arrow          visualization_msgs/Marker  vehicle_local_position.v[xyz]
+    /px4_visualizer/ground_plane            visualization_msgs/Marker  Gazebo world ground (z=0 in world frame)
 
-TF tree published:
-    map  -> base_link  (vehicle pose in ENU world)
+TF tree published (simulation):
+    world -> base_link  from Gazebo /model/tvc_0/odometry (base_link pose via xyz_offset in model.sdf)
+
+PX4 EKF topics are still published for comparison (ekf2_pose/path) but do not drive TF
+when Gazebo odometry is available.
 """
 
 import math
@@ -109,18 +113,23 @@ class Px4RvizBridge(Node):
 
         # ---------------- parameters ----------------
         self.declare_parameter('px4_namespace', '')         # e.g. '/px4_1' for multi-vehicle
-        self.declare_parameter('world_frame', 'map')
+        self.declare_parameter('world_frame', 'world')
         self.declare_parameter('body_frame', 'base_link')
         self.declare_parameter('path_max_length', 5000)
         self.declare_parameter('publish_tf', True)
-        self.declare_parameter('gz_odometry_topic', '/model/tvc_0/odometry_with_covariance')
+        self.declare_parameter('publish_ground', True)
+        self.declare_parameter('ground_size', 500.0)
+        self.declare_parameter('gz_odometry_topic', '/model/tvc_0/odometry')
 
         self._ns: str = self.get_parameter('px4_namespace').value.rstrip('/')
         self._world_frame: str = self.get_parameter('world_frame').value
         self._body_frame: str = self.get_parameter('body_frame').value
         self._path_max_length: int = int(self.get_parameter('path_max_length').value)
         self._publish_tf: bool = bool(self.get_parameter('publish_tf').value)
+        self._publish_ground: bool = bool(self.get_parameter('publish_ground').value)
+        self._ground_size: float = float(self.get_parameter('ground_size').value)
         self._gz_odometry_topic: str = str(self.get_parameter('gz_odometry_topic').value).strip()
+        self._use_gazebo_tf: bool = bool(self._gz_odometry_topic)
 
         # ---------------- QoS ----------------
         # uXRCE-DDS publishes with BEST_EFFORT, depth 1, KEEP_LAST.
@@ -210,10 +219,17 @@ class Px4RvizBridge(Node):
             NavSatFix, '/px4_visualizer/gps_fix', 10)
         self._pub_velocity_arrow = self.create_publisher(
             Marker, '/px4_visualizer/velocity_arrow', 10)
+        self._pub_ground_plane = self.create_publisher(
+            Marker, '/px4_visualizer/ground_plane', 10)
+
+        if self._publish_ground:
+            self._publish_ground_plane()
+            self.create_timer(1.0, self._publish_ground_plane)
 
         self.get_logger().info(
             f'px4_rviz_bridge started (ns="{self._ns or "/"}", world="{self._world_frame}", '
             f'body="{self._body_frame}", tf={self._publish_tf}, '
+            f'gazebo_tf={self._use_gazebo_tf}, '
             f'gz_odom="{self._gz_odometry_topic or "disabled"}")'
         )
 
@@ -243,13 +259,20 @@ class Px4RvizBridge(Node):
             del path.poses[: len(path.poses) - self._path_max_length]
         publisher.publish(path)
 
-    def _broadcast_tf(self, p_enu: np.ndarray, q_xyzw: np.ndarray) -> None:
+    def _broadcast_tf(
+        self,
+        p_enu: np.ndarray,
+        q_xyzw: np.ndarray,
+        stamp=None,
+        world_frame: Optional[str] = None,
+        body_frame: Optional[str] = None,
+    ) -> None:
         if not self._publish_tf:
             return
         tf = TransformStamped()
-        tf.header.stamp = self._now_stamp()
-        tf.header.frame_id = self._world_frame
-        tf.child_frame_id = self._body_frame
+        tf.header.stamp = stamp if stamp is not None else self._now_stamp()
+        tf.header.frame_id = world_frame or self._world_frame
+        tf.child_frame_id = body_frame or self._body_frame
         tf.transform.translation.x = float(p_enu[0])
         tf.transform.translation.y = float(p_enu[1])
         tf.transform.translation.z = float(p_enu[2])
@@ -283,7 +306,8 @@ class Px4RvizBridge(Node):
         self._pub_vehicle_pose.publish(pose)
         self._append_to_path(self._ekf2_path, pose, self._pub_ekf2_path)
         self._append_to_path(self._vehicle_path, pose, self._pub_vehicle_path)
-        self._broadcast_tf(p_enu, q_xyzw)
+        if not self._use_gazebo_tf:
+            self._broadcast_tf(p_enu, q_xyzw)
 
         # Velocity arrow marker in world frame
         v_enu = ned_position_to_enu(np.array([msg.vx, msg.vy, msg.vz]))
@@ -311,7 +335,44 @@ class Px4RvizBridge(Node):
         arrow.color.a = 0.9
         self._pub_velocity_arrow.publish(arrow)
 
+    def _publish_ground_plane(self) -> None:
+        """Draw ground at z=0 in the Gazebo world frame (matches default.sdf ground_plane)."""
+        if not self._publish_ground:
+            return
+        thickness = 0.01
+        ground = Marker()
+        ground.header.stamp = self._now_stamp()
+        ground.header.frame_id = self._world_frame
+        ground.ns = 'ground_plane'
+        ground.id = 0
+        ground.type = Marker.CUBE
+        ground.action = Marker.ADD
+        ground.pose.position.x = 0.0
+        ground.pose.position.y = 0.0
+        ground.pose.position.z = -thickness * 0.5
+        ground.pose.orientation.w = 1.0
+        ground.scale.x = self._ground_size
+        ground.scale.y = self._ground_size
+        ground.scale.z = thickness
+        ground.color.r = 0.78
+        ground.color.g = 0.78
+        ground.color.b = 0.78
+        ground.color.a = 1.0
+        self._pub_ground_plane.publish(ground)
+
     def _on_gz_odometry(self, msg: Odometry) -> None:
+        world_frame = msg.header.frame_id.strip() if msg.header.frame_id.strip() else self._world_frame
+        body_frame = msg.child_frame_id.strip() if msg.child_frame_id.strip() else self._body_frame
+        if world_frame != self._world_frame:
+            self._world_frame = world_frame
+            for path in (
+                self._vehicle_path,
+                self._ekf2_path,
+                self._gz_path,
+                self._setpoint_path,
+            ):
+                path.header.frame_id = world_frame
+
         p_enu = np.array([
             msg.pose.pose.position.x,
             msg.pose.pose.position.y,
@@ -328,9 +389,20 @@ class Px4RvizBridge(Node):
         if not np.all(np.isfinite(q_xyzw)) or np.linalg.norm(q_xyzw) < 1e-6:
             q_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
 
-        pose = self._make_pose(p_enu, q_xyzw)
+        pose = PoseStamped()
+        pose.header = msg.header
+        if not pose.header.frame_id:
+            pose.header.frame_id = world_frame
+        pose.pose = msg.pose.pose
         self._pub_gz_pose.publish(pose)
         self._append_to_path(self._gz_path, pose, self._pub_gz_path)
+        self._broadcast_tf(
+            p_enu,
+            q_xyzw,
+            stamp=msg.header.stamp,
+            world_frame=world_frame,
+            body_frame=body_frame,
+        )
 
     def _on_odometry(self, msg: VehicleOdometry) -> None:
         # Pose
