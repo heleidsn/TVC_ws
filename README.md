@@ -1,10 +1,12 @@
 # PX4 Thrust Vector Control (TVC) Workspace
 
 [![ROS 2](https://img.shields.io/badge/ROS-2-blue)](https://docs.ros.org/en/humble/index.html)
-[![PX4](https://img.shields.io/badge/PX4-Compatible-green)](https://px4.io/)
+[![PX4](https://img.shields.io/badge/PX4-v1.16-green)](https://px4.io/)
 [![Gazebo](https://img.shields.io/badge/Gazebo-Harmonic-orange)](https://gazebosim.org/)
 
 This ROS 2 workspace provides a complete thrust vector control (TVC) implementation for inverted coaxial drones with PX4 autopilot integration. The workspace includes a modified PX4 autopilot, ROS 2 communication bridges, message definitions, and a custom LQR controller for precise thrust vector control of coaxial motor systems with gimbal-based thrust vectoring.
+
+> **Version notice:** This workspace has **officially migrated to PX4 v1.16**. The legacy `PX4_tvc` fork (based on PX4 v1.15.4) is no longer used. Use the `PX4-TVC-NUS` submodule with airframe `6003` and matching `px4_msgs` / `px4_ros_com` branches (`release/1.16`).
 
 ![](/assets/test_1.gif)
 ![](/assets/test_2.gif)
@@ -17,22 +19,24 @@ TVC_ws/
 ├── assets/                      # Media files and documentation assets
 │   ├── test_1.gif              # TVC demonstration video 1
 │   └── test_2.gif              # TVC demonstration video 2
-├── PX4_tvc/                     # Modified PX4 autopilot for TVC
+├── PX4-TVC-NUS/                 # Modified PX4 v1.16 autopilot for TVC (submodule)
 │   ├── src/                     # PX4 source code
 │   ├── msg/                     # PX4 message definitions
-│   ├── launch/                  # PX4 launch configurations
-│   ├── boards/                  # Hardware board configurations
+│   ├── Tools/simulation/gz/     # Gazebo Harmonic simulation (includes TVC model)
 │   └── ...                      # Standard PX4 structure
 └── src/
-    ├── px4_msgs/                # PX4 message definitions for ROS 2
-    ├── px4_ros_com/             # PX4-ROS 2 communication bridge
+    ├── px4_msgs/                # PX4 message definitions for ROS 2 (release/1.16)
+    ├── px4_ros_com/             # PX4-ROS 2 communication bridge (release/1.16)
     └── tvc_controller/          # Main TVC controller package
         ├── config/
-        │   └── tvc_params.yaml          # Controller parameters
+        │   ├── tvc_params.yaml          # Controller parameters
+        │   └── px4_rviz.rviz            # RViz2 configuration
         ├── launch/
-        │   └── lqr.launch.py            # ROS 2 launch file
+        │   ├── lqr.launch.py            # LQR controller launch file
+        │   ├── px4_rviz.launch.py       # PX4 -> RViz2 bridge launch file
+        │   └── gz_vision.launch.py      # Gazebo vision publisher launch file
         ├── models/
-        │   └── tvc/                     # Gazebo TVC drone model
+        │   └── tvc/                     # Gazebo TVC drone model (reference copy)
         │       ├── model.sdf            # SDF model definition
         │       ├── model.config         # Model configuration
         │       └── meshes/              # 3D mesh files
@@ -50,7 +54,7 @@ TVC_ws/
 - **OS**: Ubuntu 22.04 LTS (recommended) or Ubuntu 24.04 LTS
 - **ROS 2**: Humble Hawksbill (recommended) or Galactic Geochelone
 - **Python**: 3.10.12 (recommended)
-- **PX4**: v1.15.4 (SITL or hardware)
+- **PX4**: **v1.16** via `PX4-TVC-NUS` submodule (SITL or hardware)
 - **GZ**: Harmonic (recommended) or Ionic
 
 ### Dependencies
@@ -59,6 +63,13 @@ TVC_ws/
 - Python packages:
   - `numpy 1.16.0`
   - `scipy 1.15.0`
+
+### Submodule Branches (v1.16)
+| Submodule | Branch |
+|---|---|
+| `PX4-TVC-NUS` | `px4-tvc-nus-v1.16` |
+| `src/px4_msgs` | `release/1.16` |
+| `src/px4_ros_com` | `release/1.16` |
 
 ## 💿 Installation
 ### 1. ROS2 Humble
@@ -99,10 +110,10 @@ python -c "import numpy, scipy; print(f'numpy: {numpy.__version__}, scipy: {scip
 
 ### 1. Clone and Setup
 ```bash
-git clone --recursive https://github.com/yash27agarwal/TVC_ws.git
+git clone --recursive https://github.com/heleidsn/TVC_ws.git
 
-# Alternatively, clone and then initialize
-# git clone https://github.com/yash27agarwal/TVC_ws.git
+# Alternatively, clone and then initialize submodules
+# git clone https://github.com/heleidsn/TVC_ws.git
 # git submodule update --init --recursive
 
 cd TVC_ws
@@ -110,21 +121,26 @@ cd TVC_ws
 # Install ROS 2 dependencies
 rosdep update
 rosdep install --from-paths src --ignore-src -r -y
-
-# Copy TVC model file from src/tvc_controller/models/tvc to PX4_tvc/Tools/simulation/gz/models/
-cp -r ./src/tvc_controller/models/tvc ./PX4_tvc/Tools/simulation/gz/models/
 ```
+
+> **Note:** The TVC Gazebo model is bundled inside `PX4-TVC-NUS/Tools/simulation/gz/models/tvc/`. You no longer need to manually copy model files from `src/tvc_controller/models/tvc`.
 
 ### 2. Build the PX4 Workspace
 First step is to build PX4.
 ```bash
-cd PX4_tvc
-make px4_sitl_default
+cd PX4-TVC-NUS
+make px4_sitl
 
 # Try to run it
-# This command to successfully open GZ simualator with TVC platform at (0,0,0) coordinates 
-PX4_SYS_AUTOSTART=6002  ./build/px4_sitl_default/bin/px4
+# This command should open GZ simulator with the TVC platform at (0,0,0)
+PX4_SYS_AUTOSTART=6003 PX4_SIM_MODEL=tvc PX4_GZ_WORLD=default ./build/px4_sitl_default/bin/px4
 ```
+
+| Environment Variable | Description |
+|---|---|
+| `PX4_SYS_AUTOSTART=6003` | Select airframe `6003_tvc` |
+| `PX4_SIM_MODEL=tvc` | Load the TVC Gazebo model |
+| `PX4_GZ_WORLD=default` | Use the default Gazebo world |
 
 ### 3. Connect to PX4
 Ensure PX4 is running with the uXRCE-DDS bridge:
@@ -154,7 +170,7 @@ ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=bridge.yaml
 ### 5. Run the ROS2 Code
 ```bash
 # Open a new terminal
-# if you are in PX4_tvc, navigate back to TVC_ws
+# if you are in PX4-TVC-NUS, navigate back to TVC_ws
 cd ..
 
 # Build the ROS2 workspace
@@ -212,7 +228,7 @@ For debugging the data plotjuggler is highly recommended. Use the following comm
 ```bash
 plotjuggler
 ```
-In plotjuggler, import the ulog file from PX4 build. In v1.15.4 ulog files are stored in `<PX4>/build/px4_sitl_default/rootfs/log`. Then navigate to your required ulog file and import it to visulaize data. 
+In plotjuggler, import the ulog file from PX4 build. For PX4 v1.16, ulog files are stored in `PX4-TVC-NUS/build/px4_sitl_default/rootfs/log`. Then navigate to your required ulog file and import it to visulaize data. 
 
 ## ⚙️ Configuration
 
@@ -220,29 +236,48 @@ The TVC controller is configured through the `src/tvc_controller/config/tvc_para
 
 >**Note:** Make sure to match the physical properties to tvc sdf model.
 
-## 🚁 Modified PX4 (`PX4_tvc/`)
+## 🚁 Modified PX4 (`PX4-TVC-NUS/`)
 
-This workspace includes a specialized PX4 fork with modifications for TVC systems:
+This workspace includes a PX4 v1.16 fork with modifications for TVC systems:
 
 ### Key Modifications
-- **Inverted coaxial airframe**: Custom airframe configuration
-- **Enhanced ESC interface**: Improved Gazebo simulation
+- **TVC airframe `6003_tvc`**: Custom airframe configuration for Gazebo Harmonic
+- **Bundled TVC Gazebo model**: Located at `Tools/simulation/gz/models/tvc/`
 - **Gimbal integration**: Servo control for thrust vectoring
 - **Control allocation**: Specialized mixer for coaxial motors
 
 ### ⚠️ Important Notes
 - **Incompatible with standard PX4**: This modified version is specifically for TVC applications
-- **Git tag checks disabled**: For development convenience
-- **Custom airframes only**: Only works with inverted coaxial configurations
+- **Requires v1.16 message bridge**: Use `px4_msgs` and `px4_ros_com` on `release/1.16`
+- **Custom airframes only**: Only works with inverted coaxial TVC configurations
 
->**Note:** For more information refer `./PX4_tvc/README.md`
+>**Note:** For more information refer to `./PX4-TVC-NUS/README.md`
+
+## 🔄 Migration from v1.15 (`PX4_tvc`)
+
+If you are upgrading from the older setup:
+
+| Item | v1.15 (legacy) | v1.16 (current) |
+|---|---|---|
+| PX4 fork | `PX4_tvc` | `PX4-TVC-NUS` |
+| PX4 version | v1.15.4 | v1.16 |
+| Airframe ID | `6002` | `6003` |
+| `px4_msgs` / `px4_ros_com` | `release/1.15` | `release/1.16` |
+| TVC model setup | Manual copy to PX4 tree | Bundled in `PX4-TVC-NUS` |
+
+After pulling the latest changes, re-initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
 
 ## 📚 Additional Resources
 
 - [PX4 Documentation](https://docs.px4.io/)
 - [ROS 2 Documentation](https://docs.ros.org/en/humble/)
+- [PX4-TVC-NUS Repository](https://github.com/heleidsn/PX4-TVC-NUS)
 
 ---
 
 **Maintainer**: yash.27.agarwal@gmail.com  
-**Last Updated**: July 2025
+**Last Updated**: May 2026
