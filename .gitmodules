@@ -13,3 +13,8 @@
 	path = PX4-TVC-NUS
 	url = https://github.com/heleidsn/PX4-TVC-NUS.git
 	branch = px4-tvc-nus-v1.16
+
+[submodule "TVC-traj-opt"]
+	path = TVC-traj-opt
+	url = https://github.com/heleidsn/TVC-traj-opt.git
+	branch = main
