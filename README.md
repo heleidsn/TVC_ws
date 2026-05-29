@@ -132,6 +132,9 @@ Ensure PX4 is running with the uXRCE-DDS bridge:
 # For SITL
 # Open a new terminal
 MicroXRCEAgent udp4 -p 8888
+
+# for my machine
+micro-xrce-dds-agent udp4 -p 8888
 ```
 
 ### 4. Bind GZ clock to ROS2
@@ -139,6 +142,13 @@ MicroXRCEAgent udp4 -p 8888
 # Bind GZ clock to ros2
 # Open a new terminal
 ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock
+
+# for ground truth odometry
+ros2 run ros_gz_bridge parameter_bridge /model/tvc_0/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry
+ros2 run ros_gz_bridge parameter_bridge /model/x500_0/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry
+
+# or run ros_gz_bridge from a yaml file
+ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=bridge.yaml
 ```
 
 ### 5. Run the ROS2 Code

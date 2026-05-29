@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <!-- Default publisher profile -->
+    <publisher profile_name="default_publisher" is_default_profile="true">
+        <historyMemoryPolicy>DYNAMIC</historyMemoryPolicy>
+    </publisher>
+
+    <!-- Default subscriber profile -->
+    <subscriber profile_name="default_subscriber" is_default_profile="true">
+        <historyMemoryPolicy>DYNAMIC</historyMemoryPolicy>
+    </subscriber>
+
+    <!-- Data reader QoS to increase payload size limit -->
+    <data_reader profile_name="default_datareader" is_default_profile="true">
+        <qos>
+            <reliability>
+                <kind>BEST_EFFORT</kind>
+            </reliability>
+            <durability>
+                <kind>TRANSIENT_LOCAL</kind>
+            </durability>
+            <history>
+                <kind>KEEP_LAST</kind>
+                <depth>5</depth>
+            </history>
+        </qos>
+        <historyMemoryPolicy>DYNAMIC</historyMemoryPolicy>
+    </data_reader>
+
+    <!-- Data writer QoS -->
+    <data_writer profile_name="default_datawriter" is_default_profile="true">
+        <qos>
+            <reliability>
+                <kind>BEST_EFFORT</kind>
+            </reliability>
+            <durability>
+                <kind>TRANSIENT_LOCAL</kind>
+            </durability>
+            <history>
+                <kind>KEEP_LAST</kind>
+                <depth>5</depth>
+            </history>
+        </qos>
+        <historyMemoryPolicy>DYNAMIC</historyMemoryPolicy>
+    </data_writer>
+
+    <!-- Transport descriptor with increased payload size -->
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_transport</transport_id>
+            <type>UDPv4</type>
+            <maxMessageSize>65500</maxMessageSize>
+            <maxInitialPeersRange>20</maxInitialPeersRange>
+        </transport_descriptor>
+    </transport_descriptors>
+</profiles>
+
