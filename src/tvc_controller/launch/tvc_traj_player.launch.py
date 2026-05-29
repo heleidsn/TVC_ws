@@ -34,7 +34,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     csv_path = DeclareLaunchArgument(
         'csv_path',
-        default_value='/home/helei/TVC_ws/TVC-traj-opt/trajs/tvc_traj_Method_3__BoxFDDP_20260529_202933.csv',
+        default_value='/home/helei/TVC_ws/TVC-traj-opt/trajs/method_4.csv',
         description='Absolute path to a tvc trajectory CSV exported by tvc_traj_opt_gui.',
     )
     publish_rate_hz = DeclareLaunchArgument(
@@ -52,6 +52,11 @@ def generate_launch_description():
     land_after_done = DeclareLaunchArgument(
         'land_after_done', default_value='true',
         description='Whether to issue a LAND command after the hold phase.',
+    )
+    landing_timeout_s = DeclareLaunchArgument(
+        'landing_timeout_s', default_value='30.0',
+        description='Safety timeout for the LANDING stage [s]. After this, '
+                    'force DISARM and shut the node down.',
     )
     use_acc_sp = DeclareLaunchArgument(
         'use_acceleration_setpoint', default_value='true',
@@ -118,6 +123,7 @@ def generate_launch_description():
             'arm_wait_setpoints': LaunchConfiguration('arm_wait_setpoints'),
             'hold_after_done_s': LaunchConfiguration('hold_after_done_s'),
             'land_after_done': LaunchConfiguration('land_after_done'),
+            'landing_timeout_s': LaunchConfiguration('landing_timeout_s'),
             'use_acceleration_setpoint': LaunchConfiguration('use_acceleration_setpoint'),
             'origin_offset_ned': LaunchConfiguration('origin_offset_ned'),
             'do_takeoff': LaunchConfiguration('do_takeoff'),
@@ -139,6 +145,7 @@ def generate_launch_description():
         arm_wait_setpoints,
         hold_after_done_s,
         land_after_done,
+        landing_timeout_s,
         use_acc_sp,
         origin_offset_ned,
         do_takeoff,

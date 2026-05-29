@@ -197,6 +197,10 @@ class TVCTrajectoryPlayer(Node):
         self.declare_parameter('arm_wait_setpoints', 20)
         self.declare_parameter('hold_after_done_s', 2.0)
         self.declare_parameter('land_after_done', True)
+        # Safety timeout for the LANDING stage. If PX4 has not switched to
+        # DISARMED within this many seconds after the LAND command, force a
+        # DISARM and shut the node down anyway.
+        self.declare_parameter('landing_timeout_s', 30.0)
         self.declare_parameter('use_acceleration_setpoint', True)
         # Takeoff stage --------------------------------------------------
         # When True, after ARM/OFFBOARD we first hover at takeoff_altitude_m
@@ -237,6 +241,9 @@ class TVCTrajectoryPlayer(Node):
         ))
         self.land_after_done = bool(overrides.get(
             'land_after_done', self.get_parameter('land_after_done').value
+        ))
+        self.landing_timeout_s = float(overrides.get(
+            'landing_timeout_s', self.get_parameter('landing_timeout_s').value
         ))
         self.use_acceleration_setpoint = bool(overrides.get(
             'use_acceleration_setpoint',
@@ -380,6 +387,9 @@ class TVCTrajectoryPlayer(Node):
         # Takeoff bookkeeping
         self.takeoff_start_wall_ns: Optional[int] = None
         self.off_ground_wall_ns: Optional[int] = None
+        # Landing bookkeeping
+        self.land_start_wall_ns: Optional[int] = None
+        self._shutdown_requested: bool = False
         # NED hover target during the TAKEOFF stage; resolved when entering it.
         self._takeoff_hover_ned: Optional[np.ndarray] = None
         self._takeoff_yaw_rad: float = float(self._yaw[0])
@@ -716,22 +726,58 @@ class TVCTrajectoryPlayer(Node):
                 if self.land_after_done:
                     self._land()
                     self.state = self.STATE_LANDING
+                    self.land_start_wall_ns = self.get_clock().now().nanoseconds
                     self.get_logger().info('Hold complete; requesting LAND.')
                 else:
+                    self.get_logger().info(
+                        'Hold complete; land_after_done=false, exiting.'
+                    )
                     self.state = self.STATE_DONE
-                    self.get_logger().info('Hold complete; stopping (land_after_done=false).')
+                    self._request_shutdown('hold complete (no land requested)')
             return
 
         if self.state == self.STATE_LANDING:
-            if self.vehicle_status and (
-                self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_DISARMED
-            ):
+            disarmed = (
+                self.vehicle_status is not None
+                and self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_DISARMED
+            )
+            if disarmed:
                 self.state = self.STATE_DONE
-                self.get_logger().info('Vehicle disarmed; shutting down node.')
-                rclpy.shutdown()
+                self.get_logger().info('Vehicle disarmed; landing complete.')
+                self._request_shutdown('landing complete')
+                return
+
+            now_ns = self.get_clock().now().nanoseconds
+            elapsed_s = (
+                (now_ns - self.land_start_wall_ns) / 1e9
+                if self.land_start_wall_ns is not None
+                else 0.0
+            )
+            # Periodic progress log while we wait for PX4 to finish landing.
+            if self.tick % max(1, int(self.rate_hz)) == 0:
+                z_up = (-self.local_pos.z) if self.local_pos else float('nan')
+                self.get_logger().info(
+                    f'LANDING in progress: t={elapsed_s:.1f}s, '
+                    f'altitude={z_up:.2f} m'
+                )
+
+            # Safety net: if PX4 never reports DISARMED, force a disarm and
+            # shut down so the process always terminates eventually.
+            if elapsed_s >= self.landing_timeout_s:
+                self.get_logger().warn(
+                    f'Landing timeout ({self.landing_timeout_s:.1f}s) reached; '
+                    f'forcing DISARM and shutting down.'
+                )
+                self._disarm()
+                self.state = self.STATE_DONE
+                self._request_shutdown('landing timeout')
             return
 
-        # STATE_DONE: do nothing
+        if self.state == self.STATE_DONE:
+            # Reached terminal state without an outstanding shutdown request
+            # (e.g. if a future code path forgets to call _request_shutdown).
+            self._request_shutdown('STATE_DONE reached')
+            return
 
     # ---------------------------------------------------------------------
     # State entry helpers
@@ -786,6 +832,27 @@ class TVCTrajectoryPlayer(Node):
             f'Starting trajectory playback ({self.traj_duration:.2f}s, '
             f'{len(self._t)} samples).'
         )
+
+    def _request_shutdown(self, reason: str) -> None:
+        """Cleanly stop the timer and ask rclpy to exit ``spin``.
+
+        Safe to call multiple times. After this returns, ``main()`` will
+        clean up the node and the process will exit with code 0.
+        """
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        self.get_logger().info(f'Shutting down tvc_traj_player: {reason}.')
+        try:
+            if self.timer is not None:
+                self.timer.cancel()
+        except Exception:
+            pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
     def _is_airborne(self) -> bool:
         """True when the vehicle's altitude (above local origin) exceeds the
@@ -866,7 +933,7 @@ def _default_trajectory_csv() -> str:
     return ''
 
 
-def main(args=None, param_overrides: Optional[dict] = None) -> None:
+def main(args=None, param_overrides: Optional[dict] = None) -> int:
     # Strip ROS-specific argv; optional CLI overrides are passed via param_overrides.
     init_args = None
     if args is not None:
@@ -878,16 +945,24 @@ def main(args=None, param_overrides: Optional[dict] = None) -> None:
     try:
         node = TVCTrajectoryPlayer(param_overrides=param_overrides)
     except SystemExit as e:
-        rclpy.shutdown()
-        sys.exit(e.code)
+        if rclpy.ok():
+            rclpy.shutdown()
+        return int(e.code) if e.code is not None else 1
+
+    exit_code = 0
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         node.get_logger().info('Interrupted; shutting down.')
+        exit_code = 130
     finally:
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
         if rclpy.ok():
             rclpy.shutdown()
+    return exit_code
 
 
 if __name__ == '__main__':
@@ -949,4 +1024,4 @@ if __name__ == '__main__':
     if cli_args.no_land:
         overrides['land_after_done'] = False
 
-    main(param_overrides=overrides)
+    sys.exit(main(param_overrides=overrides) or 0)
