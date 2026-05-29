@@ -5,7 +5,7 @@ import shutil
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -57,6 +57,32 @@ def generate_launch_description() -> LaunchDescription:
     default_px4_binary = os.path.join(
         default_px4_dir, 'build', 'px4_sitl_default', 'bin', 'px4')
     default_microxrce_agent = _find_microxrce_agent()
+
+    # Fast DDS: allow history buffers to grow when PX4 message payloads vary
+    # (avoids RTPS_READER_HISTORY "cannot be resized" errors on /fmu/out/*).
+    # Search candidates in this order: installed share dir, src tree (so the
+    # profile still works when the user forgets to re-run `colcon build`).
+    fastrtps_profile_candidates = [
+        os.path.join(package_dir, 'fastrtps_profile.xml'),
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', 'fastrtps_profile.xml')),
+        os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', '..', '..', '..',
+            'src', 'tvc_controller', 'fastrtps_profile.xml')),
+    ]
+    fastrtps_profile = next(
+        (p for p in fastrtps_profile_candidates if os.path.isfile(p)),
+        fastrtps_profile_candidates[0],
+    )
+    set_fastrtps_profile = SetEnvironmentVariable(
+        'FASTRTPS_DEFAULT_PROFILES_FILE',
+        fastrtps_profile,
+    )
+    # The XML profile is Fast DDS specific; force the rmw to fastrtps so the
+    # historyMemoryPolicy=DYNAMIC setting is actually honored.
+    set_rmw_impl = SetEnvironmentVariable(
+        'RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp',
+    )
 
     config_file_arg = DeclareLaunchArgument(
         'config_file',
@@ -284,6 +310,8 @@ def generate_launch_description() -> LaunchDescription:
     )
 
     return LaunchDescription([
+        set_fastrtps_profile,
+        set_rmw_impl,
         config_file_arg,
         px4_namespace_arg,
         world_frame_arg,

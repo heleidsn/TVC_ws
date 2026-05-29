@@ -132,12 +132,13 @@ class Px4RvizBridge(Node):
         self._use_gazebo_tf: bool = bool(self._gz_odometry_topic)
 
         # ---------------- QoS ----------------
-        # uXRCE-DDS publishes with BEST_EFFORT, depth 1, KEEP_LAST.
-        # TRANSIENT_LOCAL is what PX4-side uses for some topics; using VOLATILE is
-        # fine for subscribers and matches more PX4 publishers.
+        # Match px4_ros_com / lqr_controller_node: PX4 uXRCE-DDS uses
+        # BEST_EFFORT + TRANSIENT_LOCAL. VOLATILE here caused DDS history slots
+        # to be sized for the first (smaller) sample and later samples fail with
+        # "payload size ... larger than the history payload size ... cannot be resized".
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
@@ -361,17 +362,16 @@ class Px4RvizBridge(Node):
         self._pub_ground_plane.publish(ground)
 
     def _on_gz_odometry(self, msg: Odometry) -> None:
-        world_frame = msg.header.frame_id.strip() if msg.header.frame_id.strip() else self._world_frame
-        body_frame = msg.child_frame_id.strip() if msg.child_frame_id.strip() else self._body_frame
-        if world_frame != self._world_frame:
-            self._world_frame = world_frame
-            for path in (
-                self._vehicle_path,
-                self._ekf2_path,
-                self._gz_path,
-                self._setpoint_path,
-            ):
-                path.header.frame_id = world_frame
+        # Always relabel the Gazebo odometry to our configured world frame.
+        # Gazebo Sim publishes /model/<name>/odometry with frame_id="odom" by
+        # default, but the rest of the visualisation pipeline (rviz Fixed
+        # Frame, paths, ground-plane marker, TF tree) is anchored at the
+        # configured world_frame (default "world"). Letting "odom" propagate
+        # would split the TF tree and cause rviz Message Filter queues to
+        # overflow ("dropping message: frame 'odom' ... queue is full").
+        world_frame = self._world_frame
+        incoming_body = msg.child_frame_id.strip()
+        body_frame = incoming_body if incoming_body else self._body_frame
 
         p_enu = np.array([
             msg.pose.pose.position.x,
@@ -390,9 +390,8 @@ class Px4RvizBridge(Node):
             q_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
 
         pose = PoseStamped()
-        pose.header = msg.header
-        if not pose.header.frame_id:
-            pose.header.frame_id = world_frame
+        pose.header.stamp = msg.header.stamp
+        pose.header.frame_id = world_frame
         pose.pose = msg.pose.pose
         self._pub_gz_pose.publish(pose)
         self._append_to_path(self._gz_path, pose, self._pub_gz_path)

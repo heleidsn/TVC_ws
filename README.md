@@ -140,6 +140,8 @@ Build the ROS 2 workspace:
 
 ```bash
 colcon build
+colcon build --packages-select tvc_controller --symlink-install
+
 source install/setup.bash
 ```
 
