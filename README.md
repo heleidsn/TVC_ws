@@ -32,9 +32,10 @@ TVC_ws/
         │   ├── tvc_params.yaml          # Controller parameters
         │   └── px4_rviz.rviz            # RViz2 configuration
         ├── launch/
-        │   ├── lqr.launch.py            # LQR controller launch file
-        │   ├── px4_rviz.launch.py       # PX4 -> RViz2 bridge launch file
-        │   └── gz_vision.launch.py      # Gazebo vision publisher launch file
+        │   ├── tvc.launch.py              # Unified launch: controller + bridges + RViz2
+        │   ├── lqr.launch.py            # LQR controller only (legacy)
+        │   ├── px4_rviz.launch.py       # Visualization only (legacy)
+        │   └── gz_vision.launch.py      # Gazebo vision publisher only (legacy)
         ├── models/
         │   └── tvc/                     # Gazebo TVC drone model (reference copy)
         │       ├── model.sdf            # SDF model definition
@@ -125,63 +126,90 @@ rosdep install --from-paths src --ignore-src -r -y
 
 > **Note:** The TVC Gazebo model is bundled inside `PX4-TVC-NUS/Tools/simulation/gz/models/tvc/`. You no longer need to manually copy model files from `src/tvc_controller/models/tvc`.
 
-### 2. Build the PX4 Workspace
-First step is to build PX4.
+### 2. Build PX4 and ROS 2
+
+Build PX4 first (one-time, or after PX4 code changes):
+
 ```bash
 cd PX4-TVC-NUS
 make px4_sitl
-
-# Try to run it
-# This command should open GZ simulator with the TVC platform at (0,0,0)
-PX4_SYS_AUTOSTART=6003 PX4_SIM_MODEL=tvc PX4_GZ_WORLD=default ./build/px4_sitl_default/bin/px4
+cd ..
 ```
 
-| Environment Variable | Description |
-|---|---|
-| `PX4_SYS_AUTOSTART=6003` | Select airframe `6003_tvc` |
-| `PX4_SIM_MODEL=tvc` | Load the TVC Gazebo model |
-| `PX4_GZ_WORLD=default` | Use the default Gazebo world |
+Build the ROS 2 workspace:
 
-### 3. Connect to PX4
-Ensure PX4 is running with the uXRCE-DDS bridge:
 ```bash
-# For SITL
-# Open a new terminal
+colcon build
+source install/setup.bash
+```
+
+### 3. Launch Everything
+
+The unified launch file starts **MicroXRCEAgent**, **PX4 SITL + Gazebo**, the LQR controller, Gazebo bridges, visualization bridge, external vision publisher, and RViz2:
+
+```bash
+ros2 launch tvc_controller tvc.launch.py
+```
+
+| Launch Argument | Default | Description |
+|---|---|---|
+| `launch_px4_sitl` | `true` | Start PX4 SITL with Gazebo |
+| `launch_microxrce_agent` | `true` | Start MicroXRCE-DDS agent |
+| `px4_sys_autostart` | `6003` | TVC airframe id |
+| `px4_sim_model` | `tvc` | Gazebo model name |
+| `px4_gz_world` | `default` | Gazebo world |
+| `microxrce_port` | `8888` | uXRCE-DDS UDP port |
+| `ros_startup_delay` | `5.0` | Delay before ROS nodes start (seconds) |
+
+Optional flags:
+
+```bash
+# Skip RViz2 (headless)
+ros2 launch tvc_controller tvc.launch.py launch_rviz:=false
+
+# PX4 / agent already running externally — ROS stack only
+ros2 launch tvc_controller tvc.launch.py \
+  launch_px4_sitl:=false launch_microxrce_agent:=false ros_startup_delay:=0
+
+# Controller only (no visualization / Gazebo bridges)
+ros2 launch tvc_controller tvc.launch.py \
+  launch_rviz:=false launch_gz_bridge:=false \
+  launch_px4_rviz_bridge:=false launch_gz_vision:=false
+```
+
+<details>
+<summary>Manual step-by-step (legacy)</summary>
+
+If you prefer to run components separately:
+
+```bash
+# Terminal 1: PX4 SITL
+cd PX4-TVC-NUS
+PX4_SYS_AUTOSTART=6003 PX4_SIM_MODEL=tvc PX4_GZ_WORLD=default ./build/px4_sitl_default/bin/px4
+
+# Terminal 2: MicroXRCE-DDS agent
 MicroXRCEAgent udp4 -p 8888
 
-# for my machine
-micro-xrce-dds-agent udp4 -p 8888
+# Terminal 3: ROS stack without PX4 / agent
+ros2 launch tvc_controller tvc.launch.py \
+  launch_px4_sitl:=false launch_microxrce_agent:=false ros_startup_delay:=0
 ```
 
-### 4. Bind GZ clock to ROS2
+Or run individual components:
+
 ```bash
-# Bind GZ clock to ros2
-# Open a new terminal
-ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock
+# Gazebo bridges
+ros2 run ros_gz_bridge parameter_bridge --ros-args \
+  -p config_file:=$(ros2 pkg prefix tvc_controller)/share/tvc_controller/config/bridge.yaml
 
-# for ground truth odometry
-ros2 run ros_gz_bridge parameter_bridge /model/tvc_0/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry
-ros2 run ros_gz_bridge parameter_bridge /model/x500_0/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry
-
-# or run ros_gz_bridge from a yaml file
-ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=bridge.yaml
-```
-
-### 5. Run the ROS2 Code
-```bash
-# Open a new terminal
-# if you are in PX4-TVC-NUS, navigate back to TVC_ws
-cd ..
-
-# Build the ROS2 workspace
-colcon build
-
-# Source the setup file
-source install/setup.bash
-
-# Launch the TVC controller
+# LQR controller
 ros2 launch tvc_controller lqr.launch.py
+
+# Visualization
+ros2 launch tvc_controller px4_rviz.launch.py
 ```
+
+</details>
 
 ## 🎮 Usage
 
