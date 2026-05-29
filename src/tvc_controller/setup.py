@@ -17,7 +17,8 @@ setup(
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
         # Include config files - ADD THIS LINE
         (os.path.join('share', package_name, 'config'), 
-            glob(os.path.join('config', '*.yaml'))),
+            glob(os.path.join('config', '*.yaml')) +
+            glob(os.path.join('config', '*.rviz'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,6 +30,8 @@ setup(
         'console_scripts': [
             'lqr_px4_controller = tvc_controller.lqr_controller_node:main',
             'auto_takeoff_land = tvc_controller.px4_simple_trajectory:main',
+            'px4_rviz_bridge = tvc_controller.px4_rviz_bridge:main',
+            'gz_vision_publisher = tvc_controller.gz_vision_publisher:main',
         ],
     },
 )

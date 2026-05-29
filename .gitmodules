@@ -1,11 +1,15 @@
 [submodule "src/px4_ros_com"]
 	path = src/px4_ros_com
 	url = https://github.com/PX4/px4_ros_com.git
-	branch = release/1.15
+	branch = release/1.16
 [submodule "src/px4_msgs"]
 	path = src/px4_msgs
 	url = https://github.com/PX4/px4_msgs.git
-	branch = release/1.15
-[submodule "PX4_tvc"]
-	path = PX4_tvc
-	url = https://github.com/yash27agarwal/PX4_TVC.git
+	branch = release/1.16
+# [submodule "PX4_tvc"]
+# 	path = PX4_tvc
+# 	url = https://github.com/yash27agarwal/PX4_TVC.git
+[submodule "PX4-TVC-NUS"]
+	path = PX4-TVC-NUS
+	url = https://github.com/heleidsn/PX4-TVC-NUS.git
+	branch = px4-tvc-nus-v1.16
