@@ -8,9 +8,12 @@ converts to PX4 NED / body FRD (px4_msgs/VehicleOdometry), and publishes to
 
 Frame conversion matches PX4 GZBridge::odometryCallback().
 
-Timestamps are taken from the odometry ``header.stamp`` (simulation time when
-``use_sim_time`` is enabled) so EKF2 can align vision with IMU samples. If the
-header stamp is zero, the node clock is used as a fallback.
+Timestamps must share PX4 SITL monotonic sim time (synced from Gazebo via
+gz_bridge clock). ``timestamp_sample`` prefers the odometry header stamp;
+stale or missing stamps fall back to the node clock (``use_sim_time``).
+
+Set PX4 param ``SIM_GZ_EXT_VIS=1`` when using this node so gz_bridge does not
+also publish vehicle_visual_odometry internally (duplicate/conflicting samples).
 """
 
 import math
@@ -32,6 +35,7 @@ from scipy.spatial.transform import Rotation as R
 
 _ENU_TO_NED = R.from_quat([math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0]).inv()
 _FLU_TO_FRD = R.from_quat([1.0, 0.0, 0.0, 0.0])
+_NAN3 = [float('nan'), float('nan'), float('nan')]
 
 
 def enu_position_to_ned(p_enu: np.ndarray) -> np.ndarray:
@@ -62,6 +66,8 @@ class GzVisionPublisher(Node):
         self.declare_parameter('orientation_variance', 0.01)
         self.declare_parameter('velocity_variance', 0.01)
         self.declare_parameter('quality', 100)
+        self.declare_parameter('publish_velocity', True)
+        self.declare_parameter('max_sample_age_us', 50_000)
 
         ns = str(self.get_parameter('px4_namespace').value).rstrip('/')
         gz_topic = str(self.get_parameter('gz_odometry_topic').value).strip()
@@ -69,6 +75,8 @@ class GzVisionPublisher(Node):
         self._orientation_var = float(self.get_parameter('orientation_variance').value)
         self._velocity_var = float(self.get_parameter('velocity_variance').value)
         self._quality = int(self.get_parameter('quality').value)
+        self._publish_velocity = bool(self.get_parameter('publish_velocity').value)
+        self._max_sample_age_us = int(self.get_parameter('max_sample_age_us').value)
 
         px4_in_topic = (
             f'{ns}/fmu/in/vehicle_visual_odometry'
@@ -79,7 +87,7 @@ class GzVisionPublisher(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=10,
         )
 
         self._pub_visual_odom = self.create_publisher(
@@ -89,20 +97,32 @@ class GzVisionPublisher(Node):
             self.get_logger().error('gz_odometry_topic is empty; nothing to subscribe to')
             return
 
-        self.create_subscription(Odometry, gz_topic, self._on_gz_odometry, 10)
+        self.create_subscription(Odometry, gz_topic, self._on_gz_odometry, 50)
 
-        self._debug_counter = 0
+        self._msg_count = 0
+        self._last_log_ns = 0
         self.get_logger().info(
             f'gz_vision_publisher: {gz_topic} -> {px4_in_topic} '
-            f'(odom-relative ENU -> PX4 local NED)'
+            f'(publish_velocity={self._publish_velocity}, '
+            f'max_sample_age_us={self._max_sample_age_us})'
         )
 
     def _stamp_us_from_header(self, msg: Odometry) -> int:
-        """Return odometry measurement time in microseconds (PX4 format)."""
         stamp = msg.header.stamp
         if stamp.sec > 0 or stamp.nanosec > 0:
             return int(stamp.sec * 1_000_000 + stamp.nanosec // 1000)
-        return int(self.get_clock().now().nanoseconds // 1000)
+        return 0
+
+    def _sample_time_us(self, msg: Odometry) -> int:
+        """Pick a sample time aligned with PX4 HRT / ROS sim clock."""
+        now_us = int(self.get_clock().now().nanoseconds // 1000)
+        header_us = self._stamp_us_from_header(msg)
+        if header_us <= 0:
+            return now_us
+        age_us = now_us - header_us
+        if age_us < 0 or age_us > self._max_sample_age_us:
+            return now_us
+        return header_us
 
     def _on_gz_odometry(self, msg: Odometry) -> None:
         p_enu = np.array([
@@ -125,32 +145,39 @@ class GzVisionPublisher(Node):
         p_ned = enu_position_to_ned(p_enu)
         q_wxyz = flu_enu_to_frd_ned_quat(q_flu_enu)
 
+        now_us = int(self.get_clock().now().nanoseconds // 1000)
+        sample_us = self._sample_time_us(msg)
+
         out = VehicleOdometry()
-        stamp_us = self._stamp_us_from_header(msg)
-        out.timestamp_sample = stamp_us
-        out.timestamp = int(self.get_clock().now().nanoseconds // 1000)
+        out.timestamp_sample = sample_us
+        out.timestamp = now_us
 
         out.pose_frame = VehicleOdometry.POSE_FRAME_NED
         out.position = [float(p_ned[0]), float(p_ned[1]), float(p_ned[2])]
         out.q = [float(q_wxyz[0]), float(q_wxyz[1]), float(q_wxyz[2]), float(q_wxyz[3])]
 
         out.velocity_frame = VehicleOdometry.VELOCITY_FRAME_BODY_FRD
-        v_flu = np.array([
-            msg.twist.twist.linear.x,
-            msg.twist.twist.linear.y,
-            msg.twist.twist.linear.z,
-        ], dtype=float)
-        w_flu = np.array([
-            msg.twist.twist.angular.x,
-            msg.twist.twist.angular.y,
-            msg.twist.twist.angular.z,
-        ], dtype=float)
-        if np.all(np.isfinite(v_flu)):
-            v_frd = flu_to_frd(v_flu)
-            out.velocity = [float(v_frd[0]), float(v_frd[1]), float(v_frd[2])]
-        if np.all(np.isfinite(w_flu)):
-            w_frd = flu_to_frd(w_flu)
-            out.angular_velocity = [float(w_frd[0]), float(w_frd[1]), float(w_frd[2])]
+        out.velocity = list(_NAN3)
+        out.angular_velocity = list(_NAN3)
+
+        if self._publish_velocity:
+            v_flu = np.array([
+                msg.twist.twist.linear.x,
+                msg.twist.twist.linear.y,
+                msg.twist.twist.linear.z,
+            ], dtype=float)
+            w_flu = np.array([
+                msg.twist.twist.angular.x,
+                msg.twist.twist.angular.y,
+                msg.twist.twist.angular.z,
+            ], dtype=float)
+            if np.all(np.isfinite(v_flu)):
+                v_frd = flu_to_frd(v_flu)
+                out.velocity = [float(v_frd[0]), float(v_frd[1]), float(v_frd[2])]
+            if np.all(np.isfinite(w_flu)):
+                w_frd = flu_to_frd(w_flu)
+                out.angular_velocity = [
+                    float(w_frd[0]), float(w_frd[1]), float(w_frd[2])]
 
         out.position_variance = [
             self._position_var, self._position_var, self._position_var]
@@ -162,12 +189,16 @@ class GzVisionPublisher(Node):
 
         self._pub_visual_odom.publish(out)
 
-        self._debug_counter += 1
-        # if self._debug_counter % 50 == 0:
-        #     self.get_logger().info(
-        #         f'gz odom ENU [{p_enu[0]:.3f}, {p_enu[1]:.3f}, {p_enu[2]:.3f}] -> '
-        #         f'vision NED [{p_ned[0]:.3f}, {p_ned[1]:.3f}, {p_ned[2]:.3f}]'
-        #     )
+        self._msg_count += 1
+        if self._msg_count == 1:
+            self.get_logger().info(
+                f'First vision sample: sample_us={sample_us}, now_us={now_us}, '
+                f'header_us={self._stamp_us_from_header(msg)}'
+            )
+        now_ns = self.get_clock().now().nanoseconds
+        if now_ns - self._last_log_ns > 10_000_000_000:
+            self._last_log_ns = now_ns
+            self.get_logger().debug(f'vision publish count={self._msg_count}')
 
 
 def main(args: Optional[List[str]] = None) -> None:

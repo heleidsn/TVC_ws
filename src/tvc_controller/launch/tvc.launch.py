@@ -50,6 +50,7 @@ def generate_launch_description() -> LaunchDescription:
     package_name = 'tvc_controller'
     package_dir = get_package_share_directory(package_name)
     default_config_file = os.path.join(package_dir, 'config', 'tvc_params.yaml')
+    default_gz_vision_config = os.path.join(package_dir, 'config', 'gz_vision.yaml')
     default_rviz_config = os.path.join(package_dir, 'config', 'px4_rviz.rviz')
     default_bridge_config = os.path.join(package_dir, 'config', 'bridge.yaml')
     default_px4_dir = _default_px4_dir(package_dir)
@@ -156,8 +157,12 @@ def generate_launch_description() -> LaunchDescription:
         description='UDP port for the MicroXRCE-DDS agent.',
     )
     ros_startup_delay_arg = DeclareLaunchArgument(
-        'ros_startup_delay', default_value='5.0',
-        description='Seconds to wait before starting ROS nodes (allows PX4/Gazebo to initialize).',
+        'ros_startup_delay', default_value='2.0',
+        description='Seconds to wait before visualization nodes (clock/vision start earlier).',
+    )
+    gz_bridge_delay_arg = DeclareLaunchArgument(
+        'gz_bridge_delay', default_value='1.0',
+        description='Seconds after launch before ros_gz_bridge (/clock + odometry).',
     )
     launch_px4_sitl_arg = DeclareLaunchArgument(
         'launch_px4_sitl', default_value='true',
@@ -266,11 +271,14 @@ def generate_launch_description() -> LaunchDescription:
         name='gz_vision_publisher',
         output='screen',
         emulate_tty=True,
-        parameters=[{
-            'px4_namespace': LaunchConfiguration('px4_namespace'),
-            'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
-            'use_sim_time': use_sim_time,
-        }],
+        parameters=[
+            default_gz_vision_config,
+            {
+                'px4_namespace': LaunchConfiguration('px4_namespace'),
+                'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
+                'use_sim_time': use_sim_time,
+            },
+        ],
         condition=IfCondition(LaunchConfiguration('launch_gz_vision')),
     )
 
@@ -284,6 +292,15 @@ def generate_launch_description() -> LaunchDescription:
         condition=IfCondition(LaunchConfiguration('launch_rviz')),
     )
 
+    joint_state_adapter_node = Node(
+        package=package_name,
+        executable='joint_state_adapter',
+        name='joint_state_adapter',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
+    )
+
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -293,18 +310,24 @@ def generate_launch_description() -> LaunchDescription:
             'robot_description': robot_description,
             'use_sim_time': use_sim_time,
         }],
-        remappings=[('/joint_states', '/tvc/joint_state')],
+        remappings=[('/joint_states', '/tvc/joint_states')],
         condition=IfCondition(LaunchConfiguration('launch_robot_model')),
     )
 
-    ros_stack = TimerAction(
-        period=LaunchConfiguration('ros_startup_delay'),
+    gz_bridge_stack = TimerAction(
+        period=LaunchConfiguration('gz_bridge_delay'),
         actions=[
             gz_bridge_node,
-            # lqr_controller_node,
-            robot_state_publisher_node,
-            px4_rviz_bridge_node,
             gz_vision_node,
+            joint_state_adapter_node,
+            robot_state_publisher_node,
+        ],
+    )
+
+    viz_stack = TimerAction(
+        period=LaunchConfiguration('ros_startup_delay'),
+        actions=[
+            px4_rviz_bridge_node,
             rviz_node,
         ],
     )
@@ -330,6 +353,7 @@ def generate_launch_description() -> LaunchDescription:
         microxrce_agent_arg,
         microxrce_port_arg,
         ros_startup_delay_arg,
+        gz_bridge_delay_arg,
         launch_px4_sitl_arg,
         launch_microxrce_agent_arg,
         launch_controller_arg,
@@ -340,5 +364,6 @@ def generate_launch_description() -> LaunchDescription:
         launch_robot_model_arg,
         microxrce_agent_process,
         px4_sitl_process,
-        ros_stack,
+        gz_bridge_stack,
+        viz_stack,
     ])

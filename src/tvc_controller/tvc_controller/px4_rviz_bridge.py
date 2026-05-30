@@ -27,10 +27,11 @@ and republishes them as standard ROS 2 messages that RViz2 understands:
     /px4_visualizer/ground_plane            visualization_msgs/Marker  Gazebo world ground (z=0 in world frame)
 
 TF tree published (simulation):
-    world -> base_link  from Gazebo /model/tvc_0/odometry (base_link pose via xyz_offset in model.sdf)
+    world -> base_link  from Gazebo /model/tvc_0/odometry (requires xyz_offset in model.sdf
+    so OdometryPublisher reports base_link, not the model root)
 
-PX4 EKF topics are still published for comparison (ekf2_pose/path) but do not drive TF
-when Gazebo odometry is available.
+When Gazebo odometry is available it also drives vehicle_pose/path and the velocity marker.
+PX4 EKF topics (ekf2_pose/path) are still published for comparison only.
 """
 
 import math
@@ -304,15 +305,13 @@ class Px4RvizBridge(Node):
         p_enu = ned_position_to_enu(np.array([msg.x, msg.y, msg.z]))
         pose = self._make_pose(p_enu, q_xyzw)
         self._pub_ekf2_pose.publish(pose)
-        self._pub_vehicle_pose.publish(pose)
         self._append_to_path(self._ekf2_path, pose, self._pub_ekf2_path)
-        self._append_to_path(self._vehicle_path, pose, self._pub_vehicle_path)
         if not self._use_gazebo_tf:
+            self._pub_vehicle_pose.publish(pose)
+            self._append_to_path(self._vehicle_path, pose, self._pub_vehicle_path)
             self._broadcast_tf(p_enu, q_xyzw)
-
-        # Velocity arrow marker in world frame
-        v_enu = ned_position_to_enu(np.array([msg.vx, msg.vy, msg.vz]))
-        self._publish_velocity_arrow(p_enu, v_enu)
+            v_enu = ned_position_to_enu(np.array([msg.vx, msg.vy, msg.vz]))
+            self._publish_velocity_arrow(p_enu, v_enu)
 
     def _publish_velocity_arrow(self, p_enu: np.ndarray, v_enu: np.ndarray) -> None:
         arrow = Marker()
@@ -394,7 +393,9 @@ class Px4RvizBridge(Node):
         pose.header.frame_id = world_frame
         pose.pose = msg.pose.pose
         self._pub_gz_pose.publish(pose)
+        self._pub_vehicle_pose.publish(pose)
         self._append_to_path(self._gz_path, pose, self._pub_gz_path)
+        self._append_to_path(self._vehicle_path, pose, self._pub_vehicle_path)
         self._broadcast_tf(
             p_enu,
             q_xyzw,
@@ -402,6 +403,16 @@ class Px4RvizBridge(Node):
             world_frame=world_frame,
             body_frame=body_frame,
         )
+
+        v_flu = np.array([
+            msg.twist.twist.linear.x,
+            msg.twist.twist.linear.y,
+            msg.twist.twist.linear.z,
+        ], dtype=float)
+        if np.all(np.isfinite(v_flu)):
+            r_world_body = R.from_quat(q_xyzw)
+            v_enu = r_world_body.apply(v_flu)
+            self._publish_velocity_arrow(p_enu, v_enu)
 
     def _on_odometry(self, msg: VehicleOdometry) -> None:
         # Pose

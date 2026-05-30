@@ -19,7 +19,8 @@ setup(
         (os.path.join('share', package_name, 'config'),
             glob(os.path.join('config', '*.yaml')) +
             glob(os.path.join('config', '*.rviz')) +
-            glob(os.path.join('config', 'bridge.yaml'))),
+            glob(os.path.join('config', 'bridge.yaml')) +
+            glob(os.path.join('config', 'gz_vision.yaml'))),
         (os.path.join('share', package_name, 'models', 'tvc'),
             glob(os.path.join('models', 'tvc', '*.urdf'))),
     ],
@@ -36,6 +37,7 @@ setup(
             'px4_rviz_bridge = tvc_controller.px4_rviz_bridge:main',
             'gz_vision_publisher = tvc_controller.gz_vision_publisher:main',
             'tvc_traj_player = tvc_controller.tvc_traj_player:main',
+            'joint_state_adapter = tvc_controller.joint_state_adapter:main',
         ],
     },
 )

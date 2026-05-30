@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-TVC trajectory player.
+TVC mission player (trajectory CSV or PX4 waypoint sequence).
 
-Loads a CSV file exported by ``tvc_traj_opt_gui`` and publishes the trajectory
-as PX4 ``TrajectorySetpoint`` messages so PX4 (or any downstream controller)
-can track it.
+``play_mode=trajectory`` (default): OFFBOARD CSV playback via ``TrajectorySetpoint``.
+``play_mode=waypoint``: sequential ENU waypoints via ``GotoSetpoint`` in **OFFBOARD**
+    (works with local/vision position; does not require GPS / global position).
 
-Pipeline::
+Pipeline (trajectory)::
 
     [CSV file (ENU or NED)]
         |
@@ -17,24 +17,32 @@ Pipeline::
         |
         +--(/fmu/in/vehicle_command: ARM, OFFBOARD)--> PX4
 
+Pipeline (waypoint)::
+
+    [tvc_traj_player]  --(/fmu/in/offboard_control_mode heartbeat)--> PX4
+        |
+        +--(/fmu/in/goto_setpoint, NED)--> PX4 GotoControl
+        |
+        +--(/fmu/in/vehicle_command: ARM, OFFBOARD, LAND)--> PX4
+
 CSV format (produced by tvc_traj_opt_gui):
     Header lines starting with ``#`` (one of them contains ``frame: ENU`` or
     ``frame: NED``), followed by a column-name row, then numeric rows. Required
     columns: ``t,x,y,z,vx,vy,vz,qw,qx,qy,qz,yaw_deg``.
 
-State machine:
-    INIT      -> send heartbeat + hover setpoint, wait for OFFBOARD + ARMED
-    ARMING    -> request OFFBOARD then ARM repeatedly until accepted
-    TAKEOFF   -> publish a hover setpoint at the first trajectory point
-                 (CSV[0] shifted up by ``takeoff_altitude_m``); transition once
-                 the vehicle is airborne and ``|v| < start_velocity_threshold_m_s``
-                 (i.e. it has actually reached and settled at the first point)
-    PLAYING   -> publish setpoints by interpolating the CSV. The mapping between
-                 physical time and CSV time is ``t_csv = t_phys / time_scale``.
-                 ``time_scale > 1`` slows the trajectory down: velocities are
-                 divided by ``time_scale`` and accelerations by ``time_scale**2``
-    HOLDING   -> CSV done: keep publishing the last sample for a short hold
-    LANDING   -> request LAND mode, then DISARM, then exit
+State machine (fixed mission profile for every CSV):
+    INIT        -> ground setpoint at local home, then OFFBOARD + ARM
+    ARMING      -> repeat ARM/OFFBOARD until accepted
+    TAKEOFF     -> climb to home hover (0, 0, 1) ENU == (0, 0, -1) NED (+ offset)
+    GOTO_FIRST  -> fly to CSV[0] (trajectory first point)
+    HOVER_PRE   -> hold at CSV[0] for ``hover_before_play_s`` (default 2 s) once
+                   |Δp| < ``first_point_position_threshold_m`` and
+                   |v| < ``first_point_velocity_threshold_m_s`` (default 0.1 each)
+    PLAYING     -> interpolate CSV as-is
+    HOLDING     -> hold final CSV pose for ``hold_after_traj_s`` (default 2 s)
+    RETURN      -> fly back to home hover (0, 0, 1), then LAND
+    LANDING     -> wait for disarm / timeout
+    DONE        -> exit
 
 The publisher rate is configurable (``--rate``, default 50 Hz). The heartbeat
 must be sent at >=2 Hz for PX4 to stay in OFFBOARD mode; we send it every
@@ -59,7 +67,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import rclpy
@@ -67,7 +75,7 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 
-from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint,
+from px4_msgs.msg import (GotoSetpoint, OffboardControlMode, TrajectorySetpoint,
                           VehicleCommand, VehicleLocalPosition, VehicleStatus)
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -177,14 +185,91 @@ def _convert_to_ned(rows: np.ndarray, columns: List[str], frame: str) -> np.ndar
     return out
 
 
+DEFAULT_WAYPOINT_HOVER_S = 2.0
+
+DEFAULT_WAYPOINTS_ENU: List[List[float]] = [
+    [0.0, 0.0, 1.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+    [1.0, 0.0, 1.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+    [1.0, 1.0, 1.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+    [-1.0, 1.0, 2.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+    [0.0, 1.0, 2.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+    [0.0, 0.0, 1.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
+]
+
+
+@dataclass
+class WaypointNED:
+    pos_ned: np.ndarray
+    yaw_rad: float
+    hover_s: float = DEFAULT_WAYPOINT_HOVER_S
+
+
+def _parse_waypoints_enu(raw: object) -> List[List[float]]:
+    if raw is None or raw == '':
+        return [list(w) for w in DEFAULT_WAYPOINTS_ENU]
+    if isinstance(raw, str):
+        rows: List[List[float]] = []
+        for part in raw.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            rows.append([float(x) for x in part.split(',')])
+        return rows if rows else [list(w) for w in DEFAULT_WAYPOINTS_ENU]
+    try:
+        rows = [[float(v) for v in item] for item in raw]
+        return rows if rows else [list(w) for w in DEFAULT_WAYPOINTS_ENU]
+    except Exception:
+        return [list(w) for w in DEFAULT_WAYPOINTS_ENU]
+
+
+def _auto_yaw_enu_deg(waypoints_enu: Sequence[Sequence[float]], index: int) -> float:
+    if index < len(waypoints_enu) - 1:
+        dx = float(waypoints_enu[index + 1][0]) - float(waypoints_enu[index][0])
+        dy = float(waypoints_enu[index + 1][1]) - float(waypoints_enu[index][1])
+        if abs(dx) + abs(dy) > 1e-6:
+            return math.degrees(math.atan2(dy, dx))
+    if index > 0:
+        dx = float(waypoints_enu[index][0]) - float(waypoints_enu[index - 1][0])
+        dy = float(waypoints_enu[index][1]) - float(waypoints_enu[index - 1][1])
+        if abs(dx) + abs(dy) > 1e-6:
+            return math.degrees(math.atan2(dy, dx))
+    return 0.0
+
+
+def _enu_to_ned_waypoints(
+    waypoints_enu: Sequence[Sequence[float]],
+    origin_offset_ned: np.ndarray,
+) -> List[WaypointNED]:
+    out: List[WaypointNED] = []
+    for i, row in enumerate(waypoints_enu):
+        x_e, y_e, z_e = float(row[0]), float(row[1]), float(row[2])
+        yaw_deg = (
+            float(row[3]) if len(row) >= 4 else _auto_yaw_enu_deg(waypoints_enu, i)
+        )
+        hover_s = (
+            float(row[4]) if len(row) >= 5 else DEFAULT_WAYPOINT_HOVER_S
+        )
+        pos_ned = origin_offset_ned + np.array([y_e, x_e, -z_e])
+        yaw_enu_rad = math.radians(yaw_deg)
+        yaw_ned = math.pi / 2.0 - yaw_enu_rad
+        yaw_ned = (yaw_ned + math.pi) % (2.0 * math.pi) - math.pi
+        out.append(WaypointNED(pos_ned=pos_ned, yaw_rad=yaw_ned, hover_s=hover_s))
+    return out
+
+
 class TVCTrajectoryPlayer(Node):
-    """ROS 2 node that streams a CSV trajectory to PX4 as TrajectorySetpoint."""
+    """ROS 2 node: CSV trajectory (OFFBOARD) or waypoint sequence (GotoSetpoint)."""
 
     STATE_INIT = 'INIT'
     STATE_ARMING = 'ARMING'
     STATE_TAKEOFF = 'TAKEOFF'
+    STATE_GOTO_FIRST = 'GOTO_FIRST'
+    STATE_HOVER_PRE = 'HOVER_PRE'
     STATE_PLAYING = 'PLAYING'
     STATE_HOLDING = 'HOLDING'
+    STATE_RETURN = 'RETURN'
+    STATE_WP_EXECUTING = 'WP_EXECUTING'
+    STATE_WP_HOVER = 'WP_HOVER'
     STATE_LANDING = 'LANDING'
     STATE_DONE = 'DONE'
 
@@ -192,29 +277,27 @@ class TVCTrajectoryPlayer(Node):
         super().__init__('tvc_traj_player')
 
         # ---- Parameters ---------------------------------------------------
+        self.declare_parameter('play_mode', 'trajectory')
         self.declare_parameter('csv_path', '')
+        self.declare_parameter('waypoints_enu', '')
+        self.declare_parameter('waypoint_timeout_s', 120.0)
         self.declare_parameter('publish_rate_hz', 50.0)
         self.declare_parameter('arm_wait_setpoints', 20)
-        self.declare_parameter('hold_after_done_s', 2.0)
+        self.declare_parameter('hold_after_traj_s', 2.0)
         self.declare_parameter('land_after_done', True)
-        # Safety timeout for the LANDING stage. If PX4 has not switched to
-        # DISARMED within this many seconds after the LAND command, force a
-        # DISARM and shut the node down anyway.
         self.declare_parameter('landing_timeout_s', 30.0)
         self.declare_parameter('use_acceleration_setpoint', True)
-        # Takeoff stage --------------------------------------------------
-        # When True, after ARM/OFFBOARD we first hover at takeoff_altitude_m
-        # and only start replaying the CSV once the vehicle leaves the ground.
-        # The whole CSV trajectory is then shifted up by takeoff_altitude_m
-        # so its z=0 origin lines up with the hover point.
-        self.declare_parameter('do_takeoff', True)
-        self.declare_parameter('takeoff_altitude_m', 1.0)
+        self.declare_parameter('home_hover_altitude_m', 1.0)
+        self.declare_parameter('hover_before_play_s', 2.0)
         self.declare_parameter('off_ground_threshold_m', 0.3)
-        self.declare_parameter('takeoff_settle_time_s', 1.0)
         self.declare_parameter('takeoff_timeout_s', 30.0)
-        # Velocity at which the vehicle is considered "settled" at the first
-        # trajectory point – then trajectory playback starts. [m/s]
+        self.declare_parameter('approach_first_timeout_s', 60.0)
+        self.declare_parameter('return_timeout_s', 60.0)
         self.declare_parameter('start_velocity_threshold_m_s', 0.1)
+        self.declare_parameter('start_position_threshold_m', 0.5)
+        # Stricter gate before CSV playback starts (GOTO_FIRST / HOVER_PRE only).
+        self.declare_parameter('first_point_position_threshold_m', 0.1)
+        self.declare_parameter('first_point_velocity_threshold_m_s', 0.1)
         # Time-domain scaling of the CSV trajectory. ``time_scale=2.0`` makes
         # the whole playback twice as long; commanded velocities are divided
         # by ``time_scale`` and accelerations by ``time_scale**2`` so the
@@ -227,6 +310,15 @@ class TVCTrajectoryPlayer(Node):
         self.declare_parameter('viz_world_frame', 'world')
 
         overrides = param_overrides or {}
+        self.play_mode = str(
+            overrides.get('play_mode', self.get_parameter('play_mode').value)
+        ).strip().lower()
+        if self.play_mode not in ('trajectory', 'waypoint'):
+            self.get_logger().warn(
+                f'Unknown play_mode="{self.play_mode}"; using trajectory.'
+            )
+            self.play_mode = 'trajectory'
+        self.get_logger().info(f'play_mode={self.play_mode}')
         csv_path = overrides.get('csv_path') or self.get_parameter(
             'csv_path'
         ).get_parameter_value().string_value
@@ -236,8 +328,8 @@ class TVCTrajectoryPlayer(Node):
         self.arm_wait_setpoints = int(overrides.get(
             'arm_wait_setpoints', self.get_parameter('arm_wait_setpoints').value
         ))
-        self.hold_after_done_s = float(overrides.get(
-            'hold_after_done_s', self.get_parameter('hold_after_done_s').value
+        self.hold_after_traj_s = float(overrides.get(
+            'hold_after_traj_s', self.get_parameter('hold_after_traj_s').value
         ))
         self.land_after_done = bool(overrides.get(
             'land_after_done', self.get_parameter('land_after_done').value
@@ -249,27 +341,49 @@ class TVCTrajectoryPlayer(Node):
             'use_acceleration_setpoint',
             self.get_parameter('use_acceleration_setpoint').value,
         ))
-        self.do_takeoff = bool(overrides.get(
-            'do_takeoff', self.get_parameter('do_takeoff').value
+        self.home_hover_altitude_m = float(overrides.get(
+            'home_hover_altitude_m',
+            self.get_parameter('home_hover_altitude_m').value,
         ))
-        self.takeoff_altitude_m = float(overrides.get(
-            'takeoff_altitude_m', self.get_parameter('takeoff_altitude_m').value
+        self.hover_before_play_s = float(overrides.get(
+            'hover_before_play_s',
+            self.get_parameter('hover_before_play_s').value,
         ))
         self.off_ground_threshold_m = float(overrides.get(
             'off_ground_threshold_m',
             self.get_parameter('off_ground_threshold_m').value,
         ))
-        self.takeoff_settle_time_s = float(overrides.get(
-            'takeoff_settle_time_s',
-            self.get_parameter('takeoff_settle_time_s').value,
-        ))
         self.takeoff_timeout_s = float(overrides.get(
             'takeoff_timeout_s',
             self.get_parameter('takeoff_timeout_s').value,
         ))
+        self.approach_first_timeout_s = float(overrides.get(
+            'approach_first_timeout_s',
+            self.get_parameter('approach_first_timeout_s').value,
+        ))
+        self.return_timeout_s = float(overrides.get(
+            'return_timeout_s',
+            self.get_parameter('return_timeout_s').value,
+        ))
         self.start_velocity_threshold_m_s = float(overrides.get(
             'start_velocity_threshold_m_s',
             self.get_parameter('start_velocity_threshold_m_s').value,
+        ))
+        self.start_position_threshold_m = float(overrides.get(
+            'start_position_threshold_m',
+            self.get_parameter('start_position_threshold_m').value,
+        ))
+        self.first_point_position_threshold_m = float(overrides.get(
+            'first_point_position_threshold_m',
+            self.get_parameter('first_point_position_threshold_m').value,
+        ))
+        self.first_point_velocity_threshold_m_s = float(overrides.get(
+            'first_point_velocity_threshold_m_s',
+            self.get_parameter('first_point_velocity_threshold_m_s').value,
+        ))
+        self.waypoint_timeout_s = float(overrides.get(
+            'waypoint_timeout_s',
+            self.get_parameter('waypoint_timeout_s').value,
         ))
         self.time_scale = float(overrides.get(
             'time_scale', self.get_parameter('time_scale').value
@@ -288,44 +402,50 @@ class TVCTrajectoryPlayer(Node):
         except Exception:
             self.origin_offset_ned = np.zeros(3)
 
-        if not csv_path:
-            self.get_logger().error(
-                'csv_path parameter is required (path to a tvc trajectory CSV).'
+        self._waypoints: List[WaypointNED] = []
+        if self.play_mode == 'waypoint':
+            wp_raw = overrides.get(
+                'waypoints_enu', self.get_parameter('waypoints_enu').value
             )
-            raise SystemExit(2)
-        if not os.path.isfile(csv_path):
-            self.get_logger().error(f'CSV not found: {csv_path}')
-            raise SystemExit(2)
+            wp_enu = _parse_waypoints_enu(wp_raw)
+            if len(wp_enu) < 1:
+                self.get_logger().error('At least one waypoint is required.')
+                raise SystemExit(2)
+            self._waypoints = _enu_to_ned_waypoints(wp_enu, self.origin_offset_ned)
+        else:
+            if not csv_path:
+                self.get_logger().error(
+                    'csv_path parameter is required (trajectory mode).'
+                )
+                raise SystemExit(2)
+            if not os.path.isfile(csv_path):
+                self.get_logger().error(f'CSV not found: {csv_path}')
+                raise SystemExit(2)
 
-        # ---- Load + convert CSV ------------------------------------------
-        rows, meta = _load_csv(csv_path)
-        frame = meta['frame']
-        method = meta['method']
-        cols = meta['columns']
-        self.get_logger().info(
-            f'Loaded {rows.shape[0]} samples from {csv_path} '
-            f'(frame={frame}, method="{method}")'
-        )
-        rows_ned = _convert_to_ned(rows, cols, frame)
-        idx = {c: i for i, c in enumerate(cols)}
-        self._t = rows_ned[:, idx['t']]
-        if self._t[0] != 0.0:
-            self._t = self._t - self._t[0]
-        self._pos = rows_ned[:, [idx['x'], idx['y'], idx['z']]]
-        self._vel = rows_ned[:, [idx['vx'], idx['vy'], idx['vz']]]
-        self._pos += self.origin_offset_ned[None, :]
-        # When using a separate takeoff stage, shift the whole trajectory up
-        # by takeoff_altitude_m so CSV t=0 aligns with the hover altitude.
-        # (In NED, "up" is the -z direction, hence the subtraction.)
-        if self.do_takeoff:
-            self._pos[:, 2] -= self.takeoff_altitude_m
-        self._yaw = np.deg2rad(rows_ned[:, idx['yaw_deg']]) if 'yaw_deg' in idx else np.zeros(len(self._t))
-        self._acc = self._finite_diff(self._vel, self._t)
-        self._yaw_rate = self._finite_diff_1d(self._yaw, self._t, wrap_angle=True)
-        # csv_duration is the trajectory length expressed in CSV time;
-        # traj_duration is its physical playback length (after time_scale).
-        self.csv_duration = float(self._t[-1])
-        self.traj_duration = self.csv_duration * self.time_scale
+            rows, meta = _load_csv(csv_path)
+            frame = meta['frame']
+            method = meta['method']
+            cols = meta['columns']
+            self.get_logger().info(
+                f'Loaded {rows.shape[0]} samples from {csv_path} '
+                f'(frame={frame}, method="{method}")'
+            )
+            rows_ned = _convert_to_ned(rows, cols, frame)
+            idx = {c: i for i, c in enumerate(cols)}
+            self._t = rows_ned[:, idx['t']]
+            if self._t[0] != 0.0:
+                self._t = self._t - self._t[0]
+            self._pos = rows_ned[:, [idx['x'], idx['y'], idx['z']]]
+            self._vel = rows_ned[:, [idx['vx'], idx['vy'], idx['vz']]]
+            self._pos += self.origin_offset_ned[None, :]
+            self._yaw = (
+                np.deg2rad(rows_ned[:, idx['yaw_deg']])
+                if 'yaw_deg' in idx else np.zeros(len(self._t))
+            )
+            self._acc = self._finite_diff(self._vel, self._t)
+            self._yaw_rate = self._finite_diff_1d(self._yaw, self._t, wrap_angle=True)
+            self.csv_duration = float(self._t[-1])
+            self.traj_duration = self.csv_duration * self.time_scale
 
         # ---- QoS / publishers / subscribers ------------------------------
         qos = QoSProfile(
@@ -339,6 +459,9 @@ class TVCTrajectoryPlayer(Node):
         )
         self.pub_offboard = self.create_publisher(
             OffboardControlMode, '/fmu/in/offboard_control_mode', qos
+        )
+        self.pub_goto = self.create_publisher(
+            GotoSetpoint, '/fmu/in/goto_setpoint', qos
         )
         self.pub_cmd = self.create_publisher(
             VehicleCommand, '/fmu/in/vehicle_command', qos
@@ -384,32 +507,60 @@ class TVCTrajectoryPlayer(Node):
         self.local_pos: Optional[VehicleLocalPosition] = None
         self.play_start_wall_ns: Optional[int] = None
         self.hold_start_wall_ns: Optional[int] = None
-        # Takeoff bookkeeping
+        self.hover_pre_start_wall_ns: Optional[int] = None
+        # Takeoff / approach / return bookkeeping
         self.takeoff_start_wall_ns: Optional[int] = None
-        self.off_ground_wall_ns: Optional[int] = None
+        self.goto_first_start_wall_ns: Optional[int] = None
+        self.return_start_wall_ns: Optional[int] = None
+        self.wp_index = 0
+        self.wp_start_wall_ns: Optional[int] = None
+        self.wp_hover_start_wall_ns: Optional[int] = None
         # Landing bookkeeping
         self.land_start_wall_ns: Optional[int] = None
         self._shutdown_requested: bool = False
-        # NED hover target during the TAKEOFF stage; resolved when entering it.
-        self._takeoff_hover_ned: Optional[np.ndarray] = None
-        self._takeoff_yaw_rad: float = float(self._yaw[0])
+        # Fixed home hover: ENU (0, 0, alt) -> NED (0, 0, -alt) + offset.
+        self._home_hover_ned = self.origin_offset_ned + np.array(
+            [0.0, 0.0, -self.home_hover_altitude_m]
+        )
+        self._ground_ned = self.origin_offset_ned.copy()
+        self._home_yaw_rad = (
+            float(self._yaw[0]) if self.play_mode == 'trajectory' else float(self._waypoints[0].yaw_rad)
+        )
         # Growing buffer of executed setpoints (ENU) for RViz.
         self._executed_poses: List[PoseStamped] = []
 
         period = 1.0 / max(self.rate_hz, 1e-3)
         self.timer = self.create_timer(period, self._on_tick)
 
-        # Publish the (latched) planned path so RViz can render it immediately.
         self._publish_planned_path()
 
-        self.get_logger().info(
-            f'Player armed. CSV duration={self.csv_duration:.2f}s, '
-            f'time_scale={self.time_scale:.2f} -> playback={self.traj_duration:.2f}s, '
-            f'rate={self.rate_hz} Hz, samples={len(self._t)}, '
-            f'do_takeoff={self.do_takeoff}, takeoff_altitude_m={self.takeoff_altitude_m:.2f}, '
-            f'start_velocity_threshold={self.start_velocity_threshold_m_s:.2f} m/s, '
-            f'first_setpoint(NED)=p={self._pos[0]}, yaw={math.degrees(self._yaw[0]):.1f} deg'
-        )
+        if self.play_mode == 'waypoint':
+            self.get_logger().info(
+                f'Waypoint mode: {len(self._waypoints)} waypoints, '
+                f'rate={self.rate_hz} Hz, pos_thr={self.start_position_threshold_m:.2f} m, '
+                f'vel_thr={self.start_velocity_threshold_m_s:.2f} m/s'
+            )
+            for i, wp in enumerate(self._waypoints):
+                self.get_logger().info(
+                    f'  WP{i}: NED p={wp.pos_ned}, yaw={math.degrees(wp.yaw_rad):.1f} deg, '
+                    f'hover={wp.hover_s:.1f}s'
+                )
+        else:
+            self.get_logger().info(
+                f'Trajectory mode: CSV duration={self.csv_duration:.2f}s, '
+                f'time_scale={self.time_scale:.2f} -> playback={self.traj_duration:.2f}s, '
+                f'rate={self.rate_hz} Hz, samples={len(self._t)}, '
+                f'home_hover_altitude_m={self.home_hover_altitude_m:.2f}, '
+                f'home_hover(NED)={self._home_hover_ned}, '
+                f'hover_before_play_s={self.hover_before_play_s:.1f}, '
+                f'hold_after_traj_s={self.hold_after_traj_s:.1f}, '
+                f'start_velocity_threshold={self.start_velocity_threshold_m_s:.2f} m/s, '
+                f'start_position_threshold={self.start_position_threshold_m:.2f} m, '
+                f'first_point_thresholds: |Δp|<{self.first_point_position_threshold_m:.2f} m, '
+                f'|v|<{self.first_point_velocity_threshold_m_s:.2f} m/s, '
+                f'first_csv_setpoint(NED)=p={self._pos[0]}, '
+                f'yaw={math.degrees(self._yaw[0]):.1f} deg'
+            )
 
     # ---------------------------------------------------------------------
     # CSV helpers
@@ -522,6 +673,13 @@ class TVCTrajectoryPlayer(Node):
             VehicleCommand.VEHICLE_CMD_DO_SET_MODE, param1=1.0, param2=6.0
         )
 
+    def _engage_auto_loiter(self) -> None:
+        """AUTO LOITER requires a valid global position (GPS); not used in SITL+vision."""
+        self._publish_vehicle_command(
+            VehicleCommand.VEHICLE_CMD_DO_SET_MODE,
+            param1=1.0, param2=4.0, param3=3.0,
+        )
+
     def _arm(self) -> None:
         self._publish_vehicle_command(
             VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0
@@ -570,19 +728,41 @@ class TVCTrajectoryPlayer(Node):
         return msg
 
     def _publish_planned_path(self) -> None:
-        """Publish the full CSV trajectory as a ``nav_msgs/Path`` (ENU)."""
+        """Publish planned path (CSV or waypoints) as ``nav_msgs/Path`` (ENU)."""
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = self.viz_world_frame
-        for i in range(len(self._t)):
-            pose = self._make_pose_stamped(self._pos[i], float(self._yaw[i]))
-            pose.header.frame_id = self.viz_world_frame
-            path.poses.append(pose)
+        if self.play_mode == 'waypoint':
+            for wp in self._waypoints:
+                pose = self._make_pose_stamped(wp.pos_ned, wp.yaw_rad)
+                pose.header.frame_id = self.viz_world_frame
+                path.poses.append(pose)
+        else:
+            for i in range(len(self._t)):
+                pose = self._make_pose_stamped(self._pos[i], float(self._yaw[i]))
+                pose.header.frame_id = self.viz_world_frame
+                path.poses.append(pose)
         self.pub_planned_path.publish(path)
         self.get_logger().info(
             f'Published planned path on /tvc_traj_player/planned_path '
-            f'(frame_id="{self.viz_world_frame}", n={len(path.poses)})'
+            f'(mode={self.play_mode}, n={len(path.poses)})'
         )
+
+    def _publish_goto(self, wp: WaypointNED) -> None:
+        msg = GotoSetpoint()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.position = [float(wp.pos_ned[0]), float(wp.pos_ned[1]), float(wp.pos_ned[2])]
+        msg.flag_control_heading = True
+        msg.heading = float(wp.yaw_rad)
+        msg.flag_set_max_horizontal_speed = False
+        msg.max_horizontal_speed = 0.0
+        msg.flag_set_max_vertical_speed = False
+        msg.max_vertical_speed = 0.0
+        msg.flag_set_max_heading_rate = False
+        msg.max_heading_rate = 0.0
+        self.pub_goto.publish(msg)
+        pose = self._make_pose_stamped(wp.pos_ned, wp.yaw_rad)
+        self.pub_current_setpoint.publish(pose)
 
     def _publish_current_setpoint(self, s: TrajectorySample) -> None:
         pose = self._make_pose_stamped(s.pos_ned, s.yaw_rad)
@@ -604,7 +784,17 @@ class TVCTrajectoryPlayer(Node):
     # ---------------------------------------------------------------------
     def _on_tick(self) -> None:
         self.tick += 1
+        if self.play_mode == 'waypoint':
+            self._on_tick_waypoint()
+        else:
+            self._on_tick_trajectory()
+
+    def _on_tick_trajectory(self) -> None:
         self._publish_heartbeat()  # required every cycle while in OFFBOARD
+
+        if self.state in (self.STATE_LANDING, self.STATE_DONE):
+            self._on_tick_landing_done()
+            return
 
         if self.state == self.STATE_INIT:
             # Hold a ground-level hover pose so PX4 has a valid setpoint to
@@ -634,67 +824,102 @@ class TVCTrajectoryPlayer(Node):
                 self._arm()
 
             if self._is_armed_and_offboard():
-                if self.do_takeoff:
-                    self._enter_takeoff()
-                else:
-                    self._enter_playing()
+                self._enter_pre_playback()
             return
 
         if self.state == self.STATE_TAKEOFF:
-            sp = self._takeoff_setpoint_sample()
+            sp = self._home_hover_sample()
             self._publish_setpoint(sp)
             self._publish_current_setpoint(sp)
 
             now_ns = self.get_clock().now().nanoseconds
             elapsed_s = (now_ns - self.takeoff_start_wall_ns) / 1e9
+            pos_err = self._distance_to_target(sp.pos_ned)
+            v_norm = self._velocity_norm()
 
-            airborne = self._is_airborne()
-            if airborne and self.off_ground_wall_ns is None:
-                self.off_ground_wall_ns = now_ns
+            if self._is_airborne() and self.tick % max(1, int(self.rate_hz)) == 0:
                 z_up = (-self.local_pos.z) if self.local_pos else float('nan')
+                v_str = 'n/a' if v_norm is None else f'{v_norm:.3f}'
                 self.get_logger().info(
-                    f'Off the ground at t={elapsed_s:.2f}s (z={z_up:.2f} m). '
-                    f'Waiting for vehicle to settle at first trajectory point '
-                    f'(|v| < {self.start_velocity_threshold_m_s:.2f} m/s).'
+                    f'TAKEOFF: z={z_up:.2f} m, |v|={v_str} m/s, '
+                    f'|Δp|={pos_err:.2f} m, t={elapsed_s:.1f}s'
                 )
 
-            # Transition criterion: once we are off-ground AND have hovered
-            # for at least takeoff_settle_time_s, wait for the velocity to
-            # drop below the configured threshold (i.e. the vehicle has
-            # reached and stabilised at the first trajectory point).
-            if self.off_ground_wall_ns is not None:
-                settled_s = (now_ns - self.off_ground_wall_ns) / 1e9
-                v_norm = self._velocity_norm()
-                pos_err = self._distance_to_target(sp.pos_ned)
-                if (
-                    settled_s >= self.takeoff_settle_time_s
-                    and v_norm is not None
-                    and v_norm < self.start_velocity_threshold_m_s
-                ):
-                    self.get_logger().info(
-                        f'Settled at first trajectory point '
-                        f'(|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m) '
-                        f'after {settled_s:.2f}s; starting trajectory.'
-                    )
-                    self._enter_playing()
-                    return
+            if self._ready_to_start_playback(sp.pos_ned):
+                self.get_logger().info(
+                    f'Reached home hover (0,0,{self.home_hover_altitude_m:.1f}) '
+                    f'(|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m); '
+                    f'flying to first trajectory point.'
+                )
+                self._enter_goto_first()
+                return
 
-                # Periodic progress log (every ~1s) so the user can see why
-                # we have not transitioned yet.
-                if self.tick % max(1, int(self.rate_hz)) == 0:
-                    v_str = 'n/a' if v_norm is None else f'{v_norm:.3f}'
-                    self.get_logger().info(
-                        f'TAKEOFF settling: |v|={v_str} m/s, '
-                        f'|Δp|={pos_err:.2f} m, settled_s={settled_s:.2f}'
-                    )
-
-            # Safety: if takeoff has not been achieved within timeout, log and
-            # fall back to playing the trajectory anyway.
             if elapsed_s >= self.takeoff_timeout_s:
                 self.get_logger().warn(
                     f'Takeoff timeout ({self.takeoff_timeout_s:.1f}s) reached; '
-                    f'starting trajectory playback even though velocity has '
-                    f'not settled below threshold.'
+                    f'proceeding to first trajectory point anyway '
+                    f'(|v|={v_norm}, |Δp|={pos_err:.2f} m).'
+                )
+                self._enter_goto_first()
+            return
+
+        if self.state == self.STATE_GOTO_FIRST:
+            sp = self._first_point_sample()
+            self._publish_setpoint(sp)
+            self._publish_current_setpoint(sp)
+
+            now_ns = self.get_clock().now().nanoseconds
+            elapsed_s = (now_ns - self.goto_first_start_wall_ns) / 1e9
+            pos_err = self._distance_to_target(sp.pos_ned)
+            v_norm = self._velocity_norm()
+
+            if self._ready_at_first_point(sp.pos_ned):
+                self.get_logger().info(
+                    f'Reached first trajectory point '
+                    f'(|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m); '
+                    f'hovering {self.hover_before_play_s:.1f}s before playback.'
+                )
+                self._enter_hover_pre()
+                return
+
+            if self.tick % max(1, int(self.rate_hz)) == 0:
+                v_str = 'n/a' if v_norm is None else f'{v_norm:.3f}'
+                self.get_logger().info(
+                    f'GOTO_FIRST: |v|={v_str} m/s, |Δp|={pos_err:.2f} m, t={elapsed_s:.1f}s '
+                    f'(need |v|<{self.first_point_velocity_threshold_m_s:.2f}, '
+                    f'|Δp|<{self.first_point_position_threshold_m:.2f})'
+                )
+
+            if elapsed_s >= self.approach_first_timeout_s:
+                self.get_logger().warn(
+                    f'Approach-first timeout ({self.approach_first_timeout_s:.1f}s) '
+                    f'reached; still waiting for first point '
+                    f'(|v|={v_norm}, |Δp|={pos_err:.2f} m).'
+                )
+            return
+
+        if self.state == self.STATE_HOVER_PRE:
+            sp = self._first_point_sample()
+            self._publish_setpoint(sp)
+            self._publish_current_setpoint(sp)
+
+            now_ns = self.get_clock().now().nanoseconds
+            v_norm = self._velocity_norm()
+            pos_err = self._distance_to_target(sp.pos_ned)
+
+            if not self._ready_at_first_point(sp.pos_ned):
+                if self.hover_pre_start_wall_ns is not None:
+                    self.get_logger().debug(
+                        f'HOVER_PRE reset: |v|={v_norm}, |Δp|={pos_err:.2f} m'
+                    )
+                self.hover_pre_start_wall_ns = now_ns
+                return
+
+            held_s = (now_ns - self.hover_pre_start_wall_ns) / 1e9
+            if held_s >= self.hover_before_play_s:
+                self.get_logger().info(
+                    f'Pre-play hover complete ({held_s:.1f}s, '
+                    f'|v|={v_norm:.3f} m/s); starting trajectory.'
                 )
                 self._enter_playing()
             return
@@ -706,7 +931,7 @@ class TVCTrajectoryPlayer(Node):
                 self.hold_start_wall_ns = self.get_clock().now().nanoseconds
                 self.state = self.STATE_HOLDING
                 self.get_logger().info(
-                    f'Playback complete; holding final pose for {self.hold_after_done_s:.1f}s'
+                    f'Playback complete; holding final pose for {self.hold_after_traj_s:.1f}s'
                 )
             sample = self._sample_scaled(t_phys)
             self._publish_setpoint(sample)
@@ -722,12 +947,13 @@ class TVCTrajectoryPlayer(Node):
             self._publish_current_setpoint(last)
 
             held_s = (self.get_clock().now().nanoseconds - self.hold_start_wall_ns) / 1e9
-            if held_s >= self.hold_after_done_s:
+            if held_s >= self.hold_after_traj_s:
                 if self.land_after_done:
-                    self._land()
-                    self.state = self.STATE_LANDING
-                    self.land_start_wall_ns = self.get_clock().now().nanoseconds
-                    self.get_logger().info('Hold complete; requesting LAND.')
+                    self.get_logger().info(
+                        f'Post-trajectory hold complete ({held_s:.1f}s); '
+                        f'returning to home hover.'
+                    )
+                    self._enter_return()
                 else:
                     self.get_logger().info(
                         'Hold complete; land_after_done=false, exiting.'
@@ -736,10 +962,155 @@ class TVCTrajectoryPlayer(Node):
                     self._request_shutdown('hold complete (no land requested)')
             return
 
+        if self.state == self.STATE_RETURN:
+            sp = self._home_hover_sample()
+            self._publish_setpoint(sp)
+            self._publish_current_setpoint(sp)
+
+            now_ns = self.get_clock().now().nanoseconds
+            elapsed_s = (now_ns - self.return_start_wall_ns) / 1e9
+            pos_err = self._distance_to_target(sp.pos_ned)
+            v_norm = self._velocity_norm()
+
+            if self._ready_to_start_playback(sp.pos_ned):
+                self.get_logger().info(
+                    f'Reached home hover (|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m); '
+                    f'requesting LAND.'
+                )
+                self._land()
+                self.state = self.STATE_LANDING
+                self.land_start_wall_ns = now_ns
+                return
+
+            if self.tick % max(1, int(self.rate_hz)) == 0:
+                v_str = 'n/a' if v_norm is None else f'{v_norm:.3f}'
+                self.get_logger().info(
+                    f'RETURN: |v|={v_str} m/s, |Δp|={pos_err:.2f} m, t={elapsed_s:.1f}s'
+                )
+
+            if elapsed_s >= self.return_timeout_s:
+                self.get_logger().warn(
+                    f'Return timeout ({self.return_timeout_s:.1f}s) reached; '
+                    f'requesting LAND anyway (|Δp|={pos_err:.2f} m).'
+                )
+                self._land()
+                self.state = self.STATE_LANDING
+                self.land_start_wall_ns = now_ns
+            return
+
+    def _on_tick_waypoint(self) -> None:
+        # OFFBOARD heartbeat is required; GotoSetpoint drives motion (no ext. trajectory).
+        self._publish_heartbeat()
+
+        if self.state in (self.STATE_LANDING, self.STATE_DONE):
+            self._on_tick_landing_done()
+            return
+
+        if self.state == self.STATE_INIT:
+            hold = self._first_point_sample()
+            self._publish_setpoint(hold)
+            self._publish_current_setpoint(hold)
+            if self.tick >= self.arm_wait_setpoints:
+                self._engage_offboard()
+                self._arm()
+                self.state = self.STATE_ARMING
+                self.get_logger().info('Requested OFFBOARD + ARM (waypoint mode).')
+            return
+
+        if self.state == self.STATE_ARMING:
+            hold = self._first_point_sample()
+            self._publish_setpoint(hold)
+            self._publish_current_setpoint(hold)
+            if self.tick % max(1, int(self.rate_hz)) == 0:
+                self._engage_offboard()
+                self._arm()
+            if self._is_armed_and_offboard():
+                self.wp_index = 0
+                self.wp_start_wall_ns = self.get_clock().now().nanoseconds
+                self.state = self.STATE_WP_EXECUTING
+                self.get_logger().info(
+                    f'Armed + OFFBOARD; flying to waypoint 0/{len(self._waypoints) - 1}.'
+                )
+            return
+
+        if self.state == self.STATE_WP_EXECUTING:
+            wp = self._waypoints[self.wp_index]
+            self._publish_goto(wp)
+            now_ns = self.get_clock().now().nanoseconds
+            elapsed_s = (now_ns - self.wp_start_wall_ns) / 1e9
+            pos_err = self._distance_to_target(wp.pos_ned)
+            v_norm = self._velocity_norm()
+
+            if self._ready_to_start_playback(wp.pos_ned):
+                self.get_logger().info(
+                    f'Reached waypoint {self.wp_index} '
+                    f'(|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m); '
+                    f'hovering {wp.hover_s:.1f}s.'
+                )
+                self.wp_hover_start_wall_ns = now_ns
+                self.state = self.STATE_WP_HOVER
+                return
+
+            if self.tick % max(1, int(self.rate_hz)) == 0:
+                v_str = 'n/a' if v_norm is None else f'{v_norm:.3f}'
+                self.get_logger().info(
+                    f'WP{self.wp_index}: |v|={v_str} m/s, |Δp|={pos_err:.2f} m, '
+                    f't={elapsed_s:.1f}s'
+                )
+
+            if elapsed_s >= self.waypoint_timeout_s:
+                self.get_logger().warn(
+                    f'Waypoint {self.wp_index} timeout ({self.waypoint_timeout_s:.1f}s); '
+                    f'advancing (|Δp|={pos_err:.2f} m).'
+                )
+                self.wp_hover_start_wall_ns = now_ns
+                self.state = self.STATE_WP_HOVER
+            return
+
+        if self.state == self.STATE_WP_HOVER:
+            wp = self._waypoints[self.wp_index]
+            self._publish_goto(wp)
+            now_ns = self.get_clock().now().nanoseconds
+            pos_err = self._distance_to_target(wp.pos_ned)
+            v_norm = self._velocity_norm()
+
+            if not self._ready_to_start_playback(wp.pos_ned):
+                self.wp_hover_start_wall_ns = now_ns
+                return
+
+            held_s = (now_ns - self.wp_hover_start_wall_ns) / 1e9
+            if held_s < wp.hover_s:
+                return
+
+            self.get_logger().info(
+                f'Waypoint {self.wp_index} hover complete ({held_s:.1f}s); '
+                f'|v|={v_norm:.3f} m/s, |Δp|={pos_err:.2f} m.'
+            )
+            if self.wp_index >= len(self._waypoints) - 1:
+                if self.land_after_done:
+                    self._land()
+                    self.land_start_wall_ns = now_ns
+                    self.state = self.STATE_LANDING
+                    self.get_logger().info('All waypoints done; requesting LAND.')
+                else:
+                    self.state = self.STATE_DONE
+                    self._request_shutdown('all waypoints reached')
+                return
+
+            self.wp_index += 1
+            self.wp_start_wall_ns = now_ns
+            self.state = self.STATE_WP_EXECUTING
+            self.get_logger().info(
+                f'Flying to waypoint {self.wp_index}/{len(self._waypoints) - 1}.'
+            )
+            return
+
+    def _on_tick_landing_done(self) -> None:
         if self.state == self.STATE_LANDING:
             disarmed = (
                 self.vehicle_status is not None
-                and self.vehicle_status.arming_state == VehicleStatus.ARMING_STATE_DISARMED
+                and self.vehicle_status.arming_state
+                == VehicleStatus.ARMING_STATE_DISARMED
             )
             if disarmed:
                 self.state = self.STATE_DONE
@@ -750,19 +1121,13 @@ class TVCTrajectoryPlayer(Node):
             now_ns = self.get_clock().now().nanoseconds
             elapsed_s = (
                 (now_ns - self.land_start_wall_ns) / 1e9
-                if self.land_start_wall_ns is not None
-                else 0.0
+                if self.land_start_wall_ns is not None else 0.0
             )
-            # Periodic progress log while we wait for PX4 to finish landing.
             if self.tick % max(1, int(self.rate_hz)) == 0:
                 z_up = (-self.local_pos.z) if self.local_pos else float('nan')
                 self.get_logger().info(
-                    f'LANDING in progress: t={elapsed_s:.1f}s, '
-                    f'altitude={z_up:.2f} m'
+                    f'LANDING in progress: t={elapsed_s:.1f}s, altitude={z_up:.2f} m'
                 )
-
-            # Safety net: if PX4 never reports DISARMED, force a disarm and
-            # shut down so the process always terminates eventually.
             if elapsed_s >= self.landing_timeout_s:
                 self.get_logger().warn(
                     f'Landing timeout ({self.landing_timeout_s:.1f}s) reached; '
@@ -774,56 +1139,79 @@ class TVCTrajectoryPlayer(Node):
             return
 
         if self.state == self.STATE_DONE:
-            # Reached terminal state without an outstanding shutdown request
-            # (e.g. if a future code path forgets to call _request_shutdown).
             self._request_shutdown('STATE_DONE reached')
-            return
 
     # ---------------------------------------------------------------------
     # State entry helpers
     # ---------------------------------------------------------------------
     def _initial_setpoint_sample(self) -> TrajectorySample:
-        """Sample used during INIT/ARMING – hover at ground (the CSV origin).
-
-        With ``do_takeoff=True`` the CSV has been shifted up so CSV[0] is at
-        the takeoff altitude. We therefore manually undo that shift here to
-        keep the vehicle on the ground while we wait for ARM/OFFBOARD.
-        """
-        sp = self._interp(0.0)
-        sp.vel_ned = np.zeros(3)
-        sp.acc_ned = np.zeros(3)
-        sp.yawspeed_rad = 0.0
-        if self.do_takeoff:
-            sp.pos_ned = sp.pos_ned.copy()
-            sp.pos_ned[2] += self.takeoff_altitude_m  # back to ground (NED)
-        return sp
-
-    def _takeoff_setpoint_sample(self) -> TrajectorySample:
-        """Hover setpoint used during the TAKEOFF stage (CSV[0] in NED)."""
-        if self._takeoff_hover_ned is None:
-            self._takeoff_hover_ned = self._pos[0].copy()
-            self._takeoff_yaw_rad = float(self._yaw[0])
+        """Sample used during INIT/ARMING – hold at ground home (local origin)."""
         return TrajectorySample(
             t=0.0,
-            pos_ned=self._takeoff_hover_ned.copy(),
+            pos_ned=self._ground_ned.copy(),
             vel_ned=np.zeros(3),
             acc_ned=np.zeros(3),
-            yaw_rad=self._takeoff_yaw_rad,
+            yaw_rad=self._home_yaw_rad,
             yawspeed_rad=0.0,
         )
 
-    def _enter_takeoff(self) -> None:
+    def _home_hover_sample(self) -> TrajectorySample:
+        """Hover setpoint at fixed home (0, 0, alt) in ENU / NED."""
+        return TrajectorySample(
+            t=0.0,
+            pos_ned=self._home_hover_ned.copy(),
+            vel_ned=np.zeros(3),
+            acc_ned=np.zeros(3),
+            yaw_rad=self._home_yaw_rad,
+            yawspeed_rad=0.0,
+        )
+
+    def _first_point_sample(self) -> TrajectorySample:
+        """Hover setpoint at CSV[0] or first ENU waypoint (trajectory / waypoint mode)."""
+        if self.play_mode == 'waypoint':
+            wp = self._waypoints[0]
+            return TrajectorySample(
+                t=0.0,
+                pos_ned=wp.pos_ned.copy(),
+                vel_ned=np.zeros(3),
+                acc_ned=np.zeros(3),
+                yaw_rad=wp.yaw_rad,
+                yawspeed_rad=0.0,
+            )
+        return TrajectorySample(
+            t=0.0,
+            pos_ned=self._pos[0].copy(),
+            vel_ned=np.zeros(3),
+            acc_ned=np.zeros(3),
+            yaw_rad=float(self._yaw[0]),
+            yawspeed_rad=0.0,
+        )
+
+    def _enter_pre_playback(self) -> None:
+        """Climb to home hover, then goto CSV[0], hover, then PLAYING."""
         self.takeoff_start_wall_ns = self.get_clock().now().nanoseconds
-        self.off_ground_wall_ns = None
-        self._takeoff_hover_ned = self._pos[0].copy()
-        self._takeoff_yaw_rad = float(self._yaw[0])
         self.state = self.STATE_TAKEOFF
         self.get_logger().info(
-            f'Armed + OFFBOARD; taking off to '
-            f'{self.takeoff_altitude_m:.2f} m above ground (NED z = '
-            f'{self._takeoff_hover_ned[2]:.2f}). Waiting for '
-            f'altitude > {self.off_ground_threshold_m:.2f} m.'
+            f'Armed + OFFBOARD; taking off to home hover '
+            f'(0, 0, {self.home_hover_altitude_m:.1f}) ENU, '
+            f'NED p={self._home_hover_ned}.'
         )
+
+    def _enter_goto_first(self) -> None:
+        self.goto_first_start_wall_ns = self.get_clock().now().nanoseconds
+        self.state = self.STATE_GOTO_FIRST
+        first = self._pos[0]
+        self.get_logger().info(
+            f'Flying to first trajectory point (NED p={first}).'
+        )
+
+    def _enter_hover_pre(self) -> None:
+        self.hover_pre_start_wall_ns = self.get_clock().now().nanoseconds
+        self.state = self.STATE_HOVER_PRE
+
+    def _enter_return(self) -> None:
+        self.return_start_wall_ns = self.get_clock().now().nanoseconds
+        self.state = self.STATE_RETURN
 
     def _enter_playing(self) -> None:
         self.play_start_wall_ns = self.get_clock().now().nanoseconds
@@ -881,10 +1269,40 @@ class TVCTrajectoryPlayer(Node):
         """Euclidean distance between the latest local position and a NED point."""
         if self.local_pos is None:
             return float('inf')
+        if hasattr(self.local_pos, 'xy_valid') and not self.local_pos.xy_valid:
+            return float('inf')
+        if hasattr(self.local_pos, 'z_valid') and not self.local_pos.z_valid:
+            return float('inf')
         dx = float(self.local_pos.x) - float(target_ned[0])
         dy = float(self.local_pos.y) - float(target_ned[1])
         dz = float(self.local_pos.z) - float(target_ned[2])
         return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def _ready_to_start_playback(self, target_ned: np.ndarray) -> bool:
+        """True when the vehicle is close enough and slow enough at a target."""
+        v_norm = self._velocity_norm()
+        if v_norm is None:
+            return False
+        pos_err = self._distance_to_target(target_ned)
+        if not math.isfinite(pos_err):
+            return False
+        return (
+            pos_err <= self.start_position_threshold_m
+            and v_norm < self.start_velocity_threshold_m_s
+        )
+
+    def _ready_at_first_point(self, target_ned: np.ndarray) -> bool:
+        """Stricter arrival check at CSV[0] before trajectory playback."""
+        v_norm = self._velocity_norm()
+        if v_norm is None:
+            return False
+        pos_err = self._distance_to_target(target_ned)
+        if not math.isfinite(pos_err):
+            return False
+        return (
+            pos_err < self.first_point_position_threshold_m
+            and v_norm < self.first_point_velocity_threshold_m_s
+        )
 
     def _sample_scaled(self, t_phys: float) -> TrajectorySample:
         """Return a sample at physical time ``t_phys`` with time-scale applied.
@@ -970,16 +1388,17 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Play a tvc_traj_opt_gui CSV as PX4 TrajectorySetpoint messages.',
+        description='TVC mission player: CSV trajectory or PX4 waypoint sequence.',
+    )
+    parser.add_argument(
+        '--mode', choices=('trajectory', 'waypoint'), default=None,
+        help='Play mode: trajectory (CSV offboard) or waypoint (GotoSetpoint).',
     )
     parser.add_argument(
         'csv_path',
         nargs='?',
         default=None,
-        help=(
-            'Path to trajectory CSV from tvc_traj_opt_gui '
-            '(default: newest *.csv in TVC-traj-opt/trajs/)'
-        ),
+        help='Trajectory CSV path (trajectory mode only).',
     )
     parser.add_argument('--rate', type=float, default=None, help='Publish rate [Hz]')
     parser.add_argument(
@@ -987,40 +1406,57 @@ if __name__ == '__main__':
         help='Time scaling factor (>1 slows the trajectory down).',
     )
     parser.add_argument(
+        '--start-position-threshold', type=float, default=None,
+        help='Max distance [m] to a hover target before advancing the mission.',
+    )
+    parser.add_argument(
         '--start-velocity-threshold', type=float, default=None,
-        help='Speed [m/s] below which playback is triggered after takeoff.',
+        help='Speed [m/s] below which a hover target is considered reached.',
     )
     parser.add_argument(
-        '--takeoff-altitude', type=float, default=None,
-        help='Hover altitude above ground during the takeoff stage [m].',
+        '--home-hover-altitude', type=float, default=None,
+        help='Fixed home hover altitude (0,0,alt) ENU before/after trajectory [m].',
     )
     parser.add_argument(
-        '--no-takeoff', action='store_true',
-        help='Skip the separate takeoff stage and play from CSV[0] directly.',
+        '--hover-before-play', type=float, default=None,
+        help='Seconds to hover at home before starting the CSV [s].',
+    )
+    parser.add_argument(
+        '--hold-after-traj', type=float, default=None,
+        help='Seconds to hold the final CSV pose before returning home [s].',
     )
     parser.add_argument(
         '--no-land', action='store_true',
-        help='Do not send LAND after trajectory ends',
+        help='Do not return home and land after trajectory ends',
     )
     cli_args = parser.parse_args()
 
-    csv_path = cli_args.csv_path or _default_trajectory_csv()
-    if not csv_path:
-        parser.error(
-            'csv_path is required: pass a file path or export a CSV to TVC-traj-opt/trajs/'
-        )
+    overrides: dict = {}
+    if cli_args.mode is not None:
+        overrides['play_mode'] = cli_args.mode
 
-    overrides: dict = {'csv_path': csv_path}
+    if cli_args.mode != 'waypoint':
+        csv_path = cli_args.csv_path or _default_trajectory_csv()
+        if not csv_path:
+            parser.error(
+                'csv_path is required in trajectory mode: pass a file path or '
+                'export a CSV to TVC-traj-opt/trajs/'
+            )
+        overrides['csv_path'] = csv_path
     if cli_args.rate is not None:
         overrides['publish_rate_hz'] = cli_args.rate
     if cli_args.time_scale is not None:
         overrides['time_scale'] = cli_args.time_scale
     if cli_args.start_velocity_threshold is not None:
         overrides['start_velocity_threshold_m_s'] = cli_args.start_velocity_threshold
-    if cli_args.takeoff_altitude is not None:
-        overrides['takeoff_altitude_m'] = cli_args.takeoff_altitude
-    if cli_args.no_takeoff:
-        overrides['do_takeoff'] = False
+    if cli_args.start_position_threshold is not None:
+        overrides['start_position_threshold_m'] = cli_args.start_position_threshold
+    if cli_args.home_hover_altitude is not None:
+        overrides['home_hover_altitude_m'] = cli_args.home_hover_altitude
+    if cli_args.hover_before_play is not None:
+        overrides['hover_before_play_s'] = cli_args.hover_before_play
+    if cli_args.hold_after_traj is not None:
+        overrides['hold_after_traj_s'] = cli_args.hold_after_traj
     if cli_args.no_land:
         overrides['land_after_done'] = False
 

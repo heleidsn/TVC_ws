@@ -1,0 +1,12 @@
+/**:
+  ros__parameters:
+    # Forward Gazebo odometry to /fmu/in/vehicle_visual_odometry for EKF2.
+    # Requires SIM_GZ_EXT_VIS=1 in PX4 so gz_bridge does not duplicate this feed.
+    gz_odometry_topic: '/model/tvc_0/odometry'
+    # Forward Gazebo twist to PX4; requires EKF2_EV_CTRL bit2 (velocity fusion).
+    publish_velocity: true
+    max_sample_age_us: 50000
+    position_variance: 0.01
+    orientation_variance: 0.01
+    velocity_variance: 0.01
+    quality: 100

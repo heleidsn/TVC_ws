@@ -1,5 +1,8 @@
 """Publish Gazebo odometry to PX4 as vehicle_visual_odometry."""
 
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -7,6 +10,9 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+    package_dir = get_package_share_directory('tvc_controller')
+    default_gz_vision_config = os.path.join(package_dir, 'config', 'gz_vision.yaml')
+
     px4_namespace_arg = DeclareLaunchArgument(
         'px4_namespace',
         default_value='',
@@ -33,10 +39,13 @@ def generate_launch_description() -> LaunchDescription:
             name='gz_vision_publisher',
             output='screen',
             emulate_tty=True,
-            parameters=[{
-                'px4_namespace': LaunchConfiguration('px4_namespace'),
-                'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
-                'use_sim_time': LaunchConfiguration('use_sim_time'),
-            }],
+            parameters=[
+                default_gz_vision_config,
+                {
+                    'px4_namespace': LaunchConfiguration('px4_namespace'),
+                    'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
+                    'use_sim_time': LaunchConfiguration('use_sim_time'),
+                },
+            ],
         ),
     ])

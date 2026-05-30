@@ -27,6 +27,7 @@ def generate_launch_description() -> LaunchDescription:
     package_name = 'tvc_controller'
     package_dir = get_package_share_directory(package_name)
     default_rviz_config = os.path.join(package_dir, 'config', 'px4_rviz.rviz')
+    default_gz_vision_config = os.path.join(package_dir, 'config', 'gz_vision.yaml')
     robot_description = _load_robot_description(package_dir)
 
     px4_namespace_arg = DeclareLaunchArgument(
@@ -107,12 +108,24 @@ def generate_launch_description() -> LaunchDescription:
         name='gz_vision_publisher',
         output='screen',
         emulate_tty=True,
-        parameters=[{
-            'px4_namespace': LaunchConfiguration('px4_namespace'),
-            'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
-            'use_sim_time': use_sim_time,
-        }],
+        parameters=[
+            default_gz_vision_config,
+            {
+                'px4_namespace': LaunchConfiguration('px4_namespace'),
+                'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
+                'use_sim_time': use_sim_time,
+            },
+        ],
         condition=IfCondition(LaunchConfiguration('launch_gz_vision')),
+    )
+
+    joint_state_adapter_node = Node(
+        package=package_name,
+        executable='joint_state_adapter',
+        name='joint_state_adapter',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
     )
 
     robot_state_publisher_node = Node(
@@ -124,7 +137,7 @@ def generate_launch_description() -> LaunchDescription:
             'robot_description': robot_description,
             'use_sim_time': use_sim_time,
         }],
-        remappings=[('/joint_states', '/tvc/joint_state')],
+        remappings=[('/joint_states', '/tvc/joint_states')],
         condition=IfCondition(LaunchConfiguration('launch_robot_model')),
     )
 
@@ -141,6 +154,7 @@ def generate_launch_description() -> LaunchDescription:
         launch_robot_model_arg,
         bridge_node,
         gz_vision_node,
+        joint_state_adapter_node,
         robot_state_publisher_node,
         rviz_node,
     ])

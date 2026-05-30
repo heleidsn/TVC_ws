@@ -7,7 +7,7 @@ Panels:
         - /Global Options1
         - /Ground1
       Splitter Ratio: 0.5
-    Tree Height: 188
+    Tree Height: 428
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -35,10 +35,10 @@ Visualization Manager:
       Reference Frame: <Fixed Frame>
       Value: true
     - Class: rviz_default_plugins/Marker
-      Enabled: true
+      Enabled: false
       Name: Ground
       Namespaces:
-        ground_plane: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -46,59 +46,21 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /px4_visualizer/ground_plane
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        base_link:
-          Value: true
-        gimbal_mount:
-          Value: true
-        landing_leg_1:
-          Value: true
-        landing_leg_2:
-          Value: true
-        landing_leg_3:
-          Value: true
-        landing_leg_4:
-          Value: true
-        motor_housing:
-          Value: true
-        servo0_roll:
-          Value: true
-        servo1_pitch:
-          Value: true
-        top_cone:
-          Value: true
-        world:
-          Value: true
       Marker Scale: 0.5
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: true
       Tree:
-        world:
-          base_link:
-            gimbal_mount:
-              servo0_roll:
-                servo1_pitch:
-                  motor_housing:
-                    {}
-            landing_leg_1:
-              {}
-            landing_leg_2:
-              {}
-            landing_leg_3:
-              {}
-            landing_leg_4:
-              {}
-            top_cone:
-              {}
+        {}
       Update Interval: 0
-      Value: true
+      Value: false
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
@@ -391,7 +353,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 8.873658180236816
+      Distance: 4.418947219848633
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -406,20 +368,20 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.31499993801116943
+      Pitch: 0.37499988079071045
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.1049997806549072
+      Yaw: 1.1899996995925903
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 621
+  Height: 1016
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000015600000213fc0200000002fb000000100044006900730070006c006100790073010000003d0000013f000000c900fffffffb0000000a005600690065007700730100000182000000ce000000a400ffffff000001ff0000021300000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000001560000039efc0200000002fb000000100044006900730070006c006100790073010000003d0000022f000000c900fffffffb0000000a00560069006500770073010000027200000169000000a400ffffff000005f00000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 859
-  X: 278
-  Y: 224
+  Width: 1868
+  X: 52
+  Y: 27
