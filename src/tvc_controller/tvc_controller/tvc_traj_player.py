@@ -54,7 +54,8 @@ The node also publishes a few standard messages in the **world (ENU)** frame so
 the planned trajectory can be inspected in RViz alongside the live PX4 odometry
 (handled by ``px4_rviz_bridge``):
 
-* ``/tvc_traj_player/planned_path``   (``nav_msgs/Path``, latched once at start)
+* ``/tvc_traj_player/planned_path``   (``nav_msgs/Path``, volatile — no stale cache after player exits)
+* ``/tvc_traj_player/waypoint_markers`` (``visualization_msgs/MarkerArray``, volatile)
 * ``/tvc_traj_player/current_setpoint`` (``geometry_msgs/PoseStamped``, per tick)
 * ``/tvc_traj_player/executed_path``  (``nav_msgs/Path``, grows over time)
 """
@@ -79,6 +80,8 @@ from px4_msgs.msg import (GotoSetpoint, OffboardControlMode, TrajectorySetpoint,
                           VehicleCommand, VehicleLocalPosition, VehicleStatus)
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
 
 
 @dataclass
@@ -100,11 +103,12 @@ def _load_csv(path: str) -> Tuple[np.ndarray, dict]:
     rows : np.ndarray, shape (N, n_cols)
         Numeric rows.
     meta : dict
-        ``columns`` (list[str]), ``frame`` ('ENU'/'NED'), ``method`` (str).
+        ``columns``, ``frame`` ('ENU'/'NED'), ``method``, optional ``waypoints`` str.
     """
     columns: Optional[List[str]] = None
     frame = 'ENU'  # default
     method = ''
+    waypoints = ''
     data_rows: List[List[float]] = []
 
     with open(path, 'r', encoding='utf-8') as f:
@@ -121,6 +125,10 @@ def _load_csv(path: str) -> Tuple[np.ndarray, dict]:
                         frame = 'ENU'
                 if 'method:' in low:
                     method = line.split(':', 1)[1].strip()
+                if 'waypoints_enu:' in low:
+                    waypoints = line.split('waypoints_enu:', 1)[1].strip()
+                elif low.startswith('# waypoints:'):
+                    waypoints = line.split('waypoints:', 1)[1].strip()
                 continue
             if columns is None:
                 columns = [c.strip() for c in line.split(',')]
@@ -137,7 +145,7 @@ def _load_csv(path: str) -> Tuple[np.ndarray, dict]:
         raise ValueError(
             f'Column count mismatch: header has {len(columns)}, data has {rows.shape[1]}'
         )
-    return rows, {'columns': columns, 'frame': frame, 'method': method}
+    return rows, {'columns': columns, 'frame': frame, 'method': method, 'waypoints': waypoints}
 
 
 def _convert_to_ned(rows: np.ndarray, columns: List[str], frame: str) -> np.ndarray:
@@ -186,6 +194,10 @@ def _convert_to_ned(rows: np.ndarray, columns: List[str], frame: str) -> np.ndar
 
 
 DEFAULT_WAYPOINT_HOVER_S = 2.0
+WAYPOINT_MARKER_DIAMETER_M = 0.10
+WAYPOINT_MARKER_LABEL_Z_OFFSET_M = 0.14
+WAYPOINT_MARKER_ARROW_LENGTH_M = 0.35
+WAYPOINT_MARKER_ARROW_SHAFT_M = 0.035
 
 DEFAULT_WAYPOINTS_ENU: List[List[float]] = [
     [0.0, 0.0, 1.5, 0.0, DEFAULT_WAYPOINT_HOVER_S],
@@ -202,6 +214,26 @@ class WaypointNED:
     pos_ned: np.ndarray
     yaw_rad: float
     hover_s: float = DEFAULT_WAYPOINT_HOVER_S
+
+
+def _parse_viz_waypoints_enu(raw: object) -> List[List[float]]:
+    """Parse optional RViz waypoint overlay (``x,y,z,yaw_deg`` rows); empty -> []."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        rows: List[List[float]] = []
+        for part in raw.split(';'):
+            part = part.strip()
+            if not part:
+                continue
+            rows.append([float(x) for x in part.split(',')])
+        return rows
+    try:
+        return [[float(v) for v in item] for item in raw]
+    except Exception:
+        return []
 
 
 def _parse_waypoints_enu(raw: object) -> List[List[float]]:
@@ -308,6 +340,8 @@ class TVCTrajectoryPlayer(Node):
         self.declare_parameter('origin_offset_ned', [0.0, 0.0, 0.0])
         # RViz visualisation frame (ENU). Must match px4_rviz_bridge / RViz.
         self.declare_parameter('viz_world_frame', 'world')
+        # Optional ENU waypoints for RViz markers (x,y,z,yaw_deg; ``;`` separated).
+        self.declare_parameter('viz_waypoints_enu', '')
 
         overrides = param_overrides or {}
         self.play_mode = str(
@@ -426,9 +460,12 @@ class TVCTrajectoryPlayer(Node):
             frame = meta['frame']
             method = meta['method']
             cols = meta['columns']
+            self._csv_frame = frame
+            self._csv_viz_wp_rows = _parse_viz_waypoints_enu(meta.get('waypoints', ''))
             self.get_logger().info(
                 f'Loaded {rows.shape[0]} samples from {csv_path} '
-                f'(frame={frame}, method="{method}")'
+                f'(frame={frame}, method="{method}", '
+                f'execution_waypoints={len(self._csv_viz_wp_rows)})'
             )
             rows_ned = _convert_to_ned(rows, cols, frame)
             idx = {c: i for i, c in enumerate(cols)}
@@ -446,6 +483,23 @@ class TVCTrajectoryPlayer(Node):
             self._yaw_rate = self._finite_diff_1d(self._yaw, self._t, wrap_angle=True)
             self.csv_duration = float(self._t[-1])
             self.traj_duration = self.csv_duration * self.time_scale
+
+        viz_wp_raw = overrides.get(
+            'viz_waypoints_enu', self.get_parameter('viz_waypoints_enu').value
+        )
+        self._viz_wp_enu_rows = _parse_viz_waypoints_enu(viz_wp_raw)
+        self._csv_frame = 'ENU'
+        self._csv_viz_wp_rows: List[List[float]] = []
+        if self._viz_wp_enu_rows:
+            self.get_logger().info(
+                f'RViz waypoint overlay override: {len(self._viz_wp_enu_rows)} points'
+            )
+        elif self.play_mode == 'waypoint':
+            pass  # markers come from mission waypoints
+        elif self.play_mode == 'trajectory':
+            self.get_logger().info(
+                'Trajectory mode: RViz waypoints from CSV header or path endpoints'
+            )
 
         # ---- QoS / publishers / subscribers ------------------------------
         qos = QoSProfile(
@@ -476,14 +530,9 @@ class TVCTrajectoryPlayer(Node):
         )
 
         # ---- RViz visualisation publishers -------------------------------
-        # Standard ROS QoS: reliable + transient_local for the latched planned
-        # path; reliable + volatile for the live setpoint/executed path.
-        viz_latched_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
+        # Volatile QoS: when tvc_traj_player exits, DDS does not keep the last
+        # planned path / markers, so RViz opened later (e.g. PX4 SITL) does not
+        # show a stale trajectory from a previous tracking run.
         viz_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
@@ -491,13 +540,16 @@ class TVCTrajectoryPlayer(Node):
             depth=10,
         )
         self.pub_planned_path = self.create_publisher(
-            Path, '/tvc_traj_player/planned_path', viz_latched_qos
+            Path, '/tvc_traj_player/planned_path', viz_qos
         )
         self.pub_current_setpoint = self.create_publisher(
             PoseStamped, '/tvc_traj_player/current_setpoint', viz_qos
         )
         self.pub_executed_path = self.create_publisher(
             Path, '/tvc_traj_player/executed_path', viz_qos
+        )
+        self.pub_waypoint_markers = self.create_publisher(
+            MarkerArray, '/tvc_traj_player/waypoint_markers', viz_qos
         )
 
         # ---- State -------------------------------------------------------
@@ -533,6 +585,11 @@ class TVCTrajectoryPlayer(Node):
         self.timer = self.create_timer(period, self._on_tick)
 
         self._publish_planned_path()
+        self._viz_republishes_left = 20
+        self._publish_waypoint_markers()
+        self._viz_republish_timer = self.create_timer(
+            0.5, self._on_viz_republish_timer
+        )
 
         if self.play_mode == 'waypoint':
             self.get_logger().info(
@@ -747,6 +804,182 @@ class TVCTrajectoryPlayer(Node):
             f'Published planned path on /tvc_traj_player/planned_path '
             f'(mode={self.play_mode}, n={len(path.poses)})'
         )
+
+    def _viz_waypoints_enu(self) -> List[Tuple[float, float, float, float]]:
+        """Return ENU ``(x, y, z, yaw_deg)`` rows for RViz waypoint markers."""
+        if self._viz_wp_enu_rows:
+            return self._waypoint_rows_to_enu_viz(self._viz_wp_enu_rows, 'ENU')
+        if self.play_mode == 'trajectory':
+            if self._csv_viz_wp_rows:
+                return self._waypoint_rows_to_enu_viz(self._csv_viz_wp_rows, self._csv_frame)
+            return self._trajectory_endpoint_waypoints_enu()
+        if self.play_mode == 'waypoint':
+            out = []
+            for wp in self._waypoints:
+                pose = self._make_pose_stamped(wp.pos_ned, wp.yaw_rad)
+                yaw_enu_rad = 2.0 * math.atan2(
+                    pose.pose.orientation.z, pose.pose.orientation.w
+                )
+                out.append((
+                    float(pose.pose.position.x),
+                    float(pose.pose.position.y),
+                    float(pose.pose.position.z),
+                    math.degrees(yaw_enu_rad),
+                ))
+            return out
+        return []
+
+    def _waypoint_rows_to_enu_viz(
+        self, rows: Sequence[Sequence[float]], frame: str,
+    ) -> List[Tuple[float, float, float, float]]:
+        """Convert CSV / header waypoint rows to ENU for RViz markers."""
+        out: List[Tuple[float, float, float, float]] = []
+        for i, row in enumerate(rows):
+            x = float(row[0])
+            y = float(row[1])
+            z = float(row[2])
+            yaw_deg = float(row[3]) if len(row) >= 4 else 0.0
+            if str(frame).upper() == 'NED':
+                pos_ned = np.array([x, y, z], dtype=float) + self.origin_offset_ned
+                pose = self._make_pose_stamped(pos_ned, np.radians(yaw_deg))
+                yaw_enu_rad = 2.0 * math.atan2(
+                    pose.pose.orientation.z, pose.pose.orientation.w
+                )
+                out.append((
+                    float(pose.pose.position.x),
+                    float(pose.pose.position.y),
+                    float(pose.pose.position.z),
+                    math.degrees(yaw_enu_rad),
+                ))
+            else:
+                out.append((x, y, z, yaw_deg))
+        return out
+
+    def _trajectory_endpoint_waypoints_enu(self) -> List[Tuple[float, float, float, float]]:
+        """Start / end of the loaded CSV trajectory (legacy CSV without header WPs)."""
+        if not hasattr(self, '_t') or len(self._t) < 1:
+            return []
+        indices = [0]
+        if len(self._t) > 1:
+            indices.append(len(self._t) - 1)
+        out = []
+        for i in indices:
+            pose = self._make_pose_stamped(self._pos[i], float(self._yaw[i]))
+            yaw_enu_rad = 2.0 * math.atan2(
+                pose.pose.orientation.z, pose.pose.orientation.w
+            )
+            out.append((
+                float(pose.pose.position.x),
+                float(pose.pose.position.y),
+                float(pose.pose.position.z),
+                math.degrees(yaw_enu_rad),
+            ))
+        return out
+
+    def _publish_waypoint_markers(self) -> None:
+        """Publish numbered sphere + yaw-arrow markers for mission waypoints."""
+        wps = self._viz_waypoints_enu()
+        stamp = self.get_clock().now().to_msg()
+        markers = MarkerArray()
+        if not wps:
+            delete = Marker()
+            delete.header.stamp = stamp
+            delete.header.frame_id = self.viz_world_frame
+            delete.action = Marker.DELETEALL
+            markers.markers.append(delete)
+            self.pub_waypoint_markers.publish(markers)
+            return
+
+        for i, (x, y, z, yaw_deg) in enumerate(wps):
+            sphere = Marker()
+            sphere.header.stamp = stamp
+            sphere.header.frame_id = self.viz_world_frame
+            sphere.ns = 'waypoints'
+            sphere.id = i
+            sphere.type = Marker.SPHERE
+            sphere.action = Marker.ADD
+            sphere.pose.position.x = x
+            sphere.pose.position.y = y
+            sphere.pose.position.z = z
+            sphere.pose.orientation.w = 1.0
+            d = WAYPOINT_MARKER_DIAMETER_M
+            sphere.scale.x = d
+            sphere.scale.y = d
+            sphere.scale.z = d
+            sphere.color = ColorRGBA(r=0.18, g=0.80, b=0.44, a=0.95)
+            markers.markers.append(sphere)
+
+            label = Marker()
+            label.header.stamp = stamp
+            label.header.frame_id = self.viz_world_frame
+            label.ns = 'waypoint_labels'
+            label.id = i
+            label.type = Marker.TEXT_VIEW_FACING
+            label.action = Marker.ADD
+            label.pose.position.x = x
+            label.pose.position.y = y
+            label.pose.position.z = z + WAYPOINT_MARKER_LABEL_Z_OFFSET_M
+            label.pose.orientation.w = 1.0
+            label.text = f'WP{i}'
+            label.scale.z = 0.16
+            label.color = ColorRGBA(r=1.0, g=1.0, b=1.0, a=1.0)
+            markers.markers.append(label)
+
+            yaw_rad = math.radians(yaw_deg)
+            arrow = Marker()
+            arrow.header.stamp = stamp
+            arrow.header.frame_id = self.viz_world_frame
+            arrow.ns = 'waypoint_yaw'
+            arrow.id = i
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.position.x = x
+            arrow.pose.position.y = y
+            arrow.pose.position.z = z + 0.02
+            arrow.pose.orientation.z = math.sin(yaw_rad / 2.0)
+            arrow.pose.orientation.w = math.cos(yaw_rad / 2.0)
+            arrow.scale.x = WAYPOINT_MARKER_ARROW_LENGTH_M
+            arrow.scale.y = WAYPOINT_MARKER_ARROW_SHAFT_M
+            arrow.scale.z = WAYPOINT_MARKER_ARROW_SHAFT_M
+            arrow.color = ColorRGBA(r=0.95, g=0.55, b=0.10, a=0.95)
+            markers.markers.append(arrow)
+
+        self.pub_waypoint_markers.publish(markers)
+        n_markers = len(markers.markers)
+        self.get_logger().info(
+            f'Published {len(wps)} waypoint markers ({n_markers} shapes) on '
+            f'/tvc_traj_player/waypoint_markers '
+            f'(subscribers={self.pub_waypoint_markers.get_subscription_count()})'
+        )
+
+    def _on_viz_republish_timer(self) -> None:
+        """Republish planned path + waypoint markers (volatile QoS needs repeats)."""
+        if self._viz_republishes_left <= 0:
+            self._viz_republish_timer.cancel()
+            return
+        self._viz_republishes_left -= 1
+        self._publish_planned_path()
+        self._publish_waypoint_markers()
+
+    def _clear_planned_viz(self) -> None:
+        """Drop all traj_player RViz layers (planned, executed, setpoint, markers)."""
+        stamp = self.get_clock().now().to_msg()
+        empty_path = Path()
+        empty_path.header.stamp = stamp
+        empty_path.header.frame_id = self.viz_world_frame
+        self.pub_planned_path.publish(empty_path)
+        self.pub_executed_path.publish(empty_path)
+        empty_pose = PoseStamped()
+        empty_pose.header.stamp = stamp
+        empty_pose.header.frame_id = self.viz_world_frame
+        self.pub_current_setpoint.publish(empty_pose)
+        delete_markers = MarkerArray()
+        delete_all = Marker()
+        delete_all.header.stamp = stamp
+        delete_all.header.frame_id = self.viz_world_frame
+        delete_all.action = Marker.DELETEALL
+        delete_markers.markers.append(delete_all)
+        self.pub_waypoint_markers.publish(delete_markers)
 
     def _publish_goto(self, wp: WaypointNED) -> None:
         msg = GotoSetpoint()
@@ -1232,6 +1465,17 @@ class TVCTrajectoryPlayer(Node):
         self._shutdown_requested = True
         self.get_logger().info(f'Shutting down tvc_traj_player: {reason}.')
         try:
+            if self._viz_republish_timer is not None:
+                self._viz_republish_timer.cancel()
+        except Exception:
+            pass
+        try:
+            self._clear_planned_viz()
+            for _ in range(5):
+                rclpy.spin_once(self, timeout_sec=0.05)
+        except Exception:
+            pass
+        try:
             if self.timer is not None:
                 self.timer.cancel()
         except Exception:
@@ -1374,6 +1618,12 @@ def main(args=None, param_overrides: Optional[dict] = None) -> int:
         node.get_logger().info('Interrupted; shutting down.')
         exit_code = 130
     finally:
+        try:
+            node._clear_planned_viz()
+            for _ in range(5):
+                rclpy.spin_once(node, timeout_sec=0.05)
+        except Exception:
+            pass
         try:
             node.destroy_node()
         except Exception:

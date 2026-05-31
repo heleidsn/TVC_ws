@@ -121,6 +121,14 @@ def generate_launch_description():
         'viz_world_frame', default_value='world',
         description='RViz fixed frame (ENU) for planned path visualization.',
     )
+    viz_waypoints_enu = DeclareLaunchArgument(
+        'viz_waypoints_enu',
+        default_value='',
+        description=(
+            'Optional ENU waypoints for RViz markers only: '
+            'x,y,z,yaw_deg rows separated by ";".'
+        ),
+    )
     use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='Use simulation time if true.',
@@ -162,6 +170,7 @@ def generate_launch_description():
                 'first_point_velocity_threshold_m_s'),
             'time_scale': LaunchConfiguration('time_scale'),
             'viz_world_frame': LaunchConfiguration('viz_world_frame'),
+            'viz_waypoints_enu': LaunchConfiguration('viz_waypoints_enu'),
             'use_sim_time': LaunchConfiguration('use_sim_time'),
         }],
         arguments=['--ros-args', '--log-level', LaunchConfiguration('log_level')],
@@ -191,6 +200,7 @@ def generate_launch_description():
         first_point_velocity_threshold_m_s,
         time_scale,
         viz_world_frame,
+        viz_waypoints_enu,
         use_sim_time,
         log_level,
         player_node,
