@@ -1,0 +1,77 @@
+/**:
+  ros__parameters:
+    # Real platform (20 kg) — physical properties aligned with TVC-traj-opt tvc_rocket_platforms.
+    physical:
+      G: 9.81
+      DIST_COM_2_THRUST: 0.72
+      I_XX: 3.2987
+      I_YY: 3.2987
+      I_ZZ: 0.0640
+      MASS: 20.0
+
+    lqr:
+      Q_diagonal:
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 0.1
+        - 1.0
+        - 1.0
+        - 0.01
+      R_diagonal:
+        - 10.0
+        - 10.0
+        - 1.0
+        - 10.0
+
+    target:
+      position:
+        x: 5.0
+        y: 0.0
+        z: -5.0
+      velocity:
+        x_dot: 0.0
+        y_dot: 0.0
+        z_dot: 0.0
+      orientation:
+        q_x: 0.0
+        q_y: 0.0
+        q_z: 0.0
+        q_w: 1.0
+      angular_velocity:
+        p: 0.0
+        q: 0.0
+        r: 0.0
+
+    actuator_constraints:
+      servo_0:
+        min: -0.25
+        max: 0.25
+      servo_1:
+        min: -0.25
+        max: 0.25
+      thrust:
+        # Hover ~196 N; optimization uses 150–250 N. Wider band for LQR allocation.
+        min_g_multiplier: -0.25
+        max_weight_fraction: 0.28
+      torque_z:
+        min: -8.0
+        max: 8.0
+
+    control_allocation:
+      use_in_onboard_computer: true
+      thrust_coefficients:
+        ct_0: 0.000048449
+        ct_1: 0.000048449
+      moment_coefficients:
+        cm_0: 0.1
+        cm_1: 0.1
+      pwm_conversion:
+        p1: 3.1352e-4
+        p2: 0.1352
+        p3: 996.9672

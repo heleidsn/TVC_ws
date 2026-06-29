@@ -66,8 +66,8 @@ Visualization Manager:
     - Alpha: 1
       Class: rviz_default_plugins/RobotModel
       Collision Enabled: false
-      Description File: package://tvc_controller/models/tvc/tvc.urdf
-      Description Source: File
+      Description File: ""
+      Description Source: Topic
       Description Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -262,7 +262,7 @@ Visualization Manager:
       Buffer Length: 1
       Class: rviz_default_plugins/Path
       Color: 52; 152; 219
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.20000000298023224
       Head Length: 0.15000000596046448
       Length: 0.20000000298023224
@@ -285,9 +285,9 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /tvc_traj_player/planned_path
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: Mission Waypoints
       Namespaces:
         waypoint_labels: true
@@ -299,7 +299,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /tvc_traj_player/waypoint_markers
-      Value: true
+      Value: false
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -333,7 +333,7 @@ Visualization Manager:
       Axes Radius: 0.03999999910593033
       Class: rviz_default_plugins/Pose
       Color: 241; 196; 15
-      Enabled: true
+      Enabled: false
       Head Length: 0.07000000029802322
       Head Radius: 0.05000000074505806
       Name: Current Setpoint
@@ -347,7 +347,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /tvc_traj_player/current_setpoint
-      Value: true
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255

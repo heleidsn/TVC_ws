@@ -10,9 +10,6 @@ PACKAGE_DIR="$(dirname "$SCRIPT_DIR")"
 # Set FastRTPS profile file path
 export FASTRTPS_DEFAULT_PROFILES_FILE="$PACKAGE_DIR/fastrtps_profile.xml"
 
-# Enable QoS from XML
-export RMW_FASTRTPS_USE_QOS_FROM_XML=1
-
 echo "Using FastRTPS profile: $FASTRTPS_DEFAULT_PROFILES_FILE"
 echo "Starting auto_takeoff_land node..."
 

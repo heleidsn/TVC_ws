@@ -1,0 +1,207 @@
+<?xml version="1.0"?>
+<!-- Real platform RViz model (r=0.20, L=1.6): proxy-style landing gear + TVC chain. -->
+<robot name="tvc_real">
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="1.6" radius="0.20"/>
+      </geometry>
+      <material name="body_orange">
+        <color rgba="0.90 0.45 0.10 1.0"/>
+      </material>
+    </visual>
+  </link>
+
+  <link name="gimbal_mount">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.12 0.12 0.05"/>
+      </geometry>
+      <material name="gimbal_dark">
+        <color rgba="0.25 0.25 0.25 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="base_to_gimbal_mount" type="fixed">
+    <parent link="base_link"/>
+    <child link="gimbal_mount"/>
+    <origin xyz="0 0 -0.75" rpy="0 0 0"/>
+  </joint>
+
+  <link name="servo0_roll">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.03 0.09 0.045"/>
+      </geometry>
+      <material name="servo0_red">
+        <color rgba="0.9 0.3 0.3 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="servo0_roll_joint" type="revolute">
+    <parent link="gimbal_mount"/>
+    <child link="servo0_roll"/>
+    <origin xyz="0 0 -0.04" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.25" upper="0.25" effort="1.0" velocity="10.0"/>
+  </joint>
+
+  <link name="servo1_pitch">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.09 0.03 0.045"/>
+      </geometry>
+      <material name="servo1_green">
+        <color rgba="0.3 0.9 0.3 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="servo1_pitch_joint" type="revolute">
+    <parent link="servo0_roll"/>
+    <child link="servo1_pitch"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.25" upper="0.25" effort="1.0" velocity="10.0"/>
+  </joint>
+
+  <link name="motor_housing">
+    <visual name="thrust_point">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.025"/>
+      </geometry>
+      <material name="thrust_cyan">
+        <color rgba="0.2 1.0 1.0 1.0"/>
+      </material>
+    </visual>
+    <visual name="thrust_axis">
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.10" radius="0.008"/>
+      </geometry>
+      <material name="thrust_axis_blue">
+        <color rgba="0.2 0.85 1.0 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="pitch_to_motor" type="fixed">
+    <parent link="servo1_pitch"/>
+    <child link="motor_housing"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="landing_leg_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.50" radius="0.012"/>
+      </geometry>
+      <material name="leg_grey">
+        <color rgba="0.4 0.4 0.4 1.0"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="leg_1_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_leg_1"/>
+    <origin xyz="0.397 0 -0.8785" rpy="0 -0.785398 0"/>
+  </joint>
+  <link name="landing_base_1">
+    <visual>
+      <geometry>
+        <cylinder length="0.02" radius="0.04"/>
+      </geometry>
+      <material name="foot_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_1_to_base_1" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_base_1"/>
+    <origin xyz="0.573 0 -1.055" rpy="0 0 0"/>
+  </joint>
+
+  <link name="landing_leg_2">
+    <visual>
+      <geometry>
+        <cylinder length="0.50" radius="0.012"/>
+      </geometry>
+      <material name="leg_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_2_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_leg_2"/>
+    <origin xyz="0 0.397 -0.8785" rpy="0.785398 0 0"/>
+  </joint>
+  <link name="landing_base_2">
+    <visual>
+      <geometry>
+        <cylinder length="0.02" radius="0.04"/>
+      </geometry>
+      <material name="foot_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_2_to_base_2" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_base_2"/>
+    <origin xyz="0 0.573 -1.055" rpy="0 0 0"/>
+  </joint>
+
+  <link name="landing_leg_3">
+    <visual>
+      <geometry>
+        <cylinder length="0.50" radius="0.012"/>
+      </geometry>
+      <material name="leg_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_3_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_leg_3"/>
+    <origin xyz="-0.397 0 -0.8785" rpy="0 0.785398 0"/>
+  </joint>
+  <link name="landing_base_3">
+    <visual>
+      <geometry>
+        <cylinder length="0.02" radius="0.04"/>
+      </geometry>
+      <material name="foot_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_3_to_base_3" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_base_3"/>
+    <origin xyz="-0.573 0 -1.055" rpy="0 0 0"/>
+  </joint>
+
+  <link name="landing_leg_4">
+    <visual>
+      <geometry>
+        <cylinder length="0.50" radius="0.012"/>
+      </geometry>
+      <material name="leg_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_4_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_leg_4"/>
+    <origin xyz="0 -0.397 -0.8785" rpy="-0.785398 0 0"/>
+  </joint>
+  <link name="landing_base_4">
+    <visual>
+      <geometry>
+        <cylinder length="0.02" radius="0.04"/>
+      </geometry>
+      <material name="foot_grey"/>
+    </visual>
+  </link>
+  <joint name="leg_4_to_base_4" type="fixed">
+    <parent link="base_link"/>
+    <child link="landing_base_4"/>
+    <origin xyz="0 -0.573 -1.055" rpy="0 0 0"/>
+  </joint>
+</robot>

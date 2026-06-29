@@ -5,10 +5,30 @@ import shutil
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, SetEnvironmentVariable, TimerAction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+# Keep in sync with TVC-traj-opt/scripts/tvc_rocket_platforms.py::_SITL_LAUNCH
+_SITL_PLATFORMS = {
+    'proxy': {
+        'px4_sim_model': 'tvc',
+        'config_file': 'tvc_params.yaml',
+        'robot_urdf': 'tvc.urdf',
+        'gz_odometry_topic': '/model/tvc_0/odometry',
+        'gz_bridge_config': 'bridge.yaml',
+    },
+    'real': {
+        'px4_sim_model': 'tvc_real',
+        'px4_gz_model_pose': '0,0,0.35',
+        'config_file': 'tvc_params_real.yaml',
+        # Simplified visual (matches Gazebo tvc_real/model.sdf); physics in params + SDF.
+        'robot_urdf': 'tvc_real.urdf',
+        'gz_odometry_topic': '/model/tvc_real_0/odometry',
+        'gz_bridge_config': 'bridge_real.yaml',
+    },
+}
 
 
 def _default_px4_dir(package_dir: str) -> str:
@@ -32,18 +52,199 @@ def _find_microxrce_agent() -> str:
     return 'MicroXRCEAgent'
 
 
-def _load_robot_description(package_dir: str) -> str:
+def _load_robot_description(package_dir: str, urdf_name: str) -> str:
     """Load TVC URDF from install share or source tree."""
     candidates = [
-        os.path.join(package_dir, 'models', 'tvc', 'tvc.urdf'),
+        os.path.join(package_dir, 'models', 'tvc', urdf_name),
         os.path.abspath(os.path.join(
-            os.path.dirname(__file__), '..', 'models', 'tvc', 'tvc.urdf')),
+            os.path.dirname(__file__), '..', 'models', 'tvc', urdf_name)),
     ]
     for path in candidates:
         if os.path.isfile(path):
             with open(path, 'r', encoding='utf-8') as urdf_file:
                 return urdf_file.read()
-    raise FileNotFoundError('tvc.urdf not found in package share or source tree')
+    raise FileNotFoundError(f'{urdf_name} not found in package share or source tree')
+
+
+def _normalize_platform(platform_id: str) -> str:
+    pid = (platform_id or 'proxy').strip().lower()
+    if pid in ('flight',):
+        return 'real'
+    return pid if pid in _SITL_PLATFORMS else 'proxy'
+
+
+def _resolve_platform(context):
+    """Select SITL assets from ``rocket_platform`` (proxy | real)."""
+    platform = _normalize_platform(LaunchConfiguration('rocket_platform').perform(context))
+    plat = dict(_SITL_PLATFORMS[platform])
+    package_dir = get_package_share_directory('tvc_controller')
+    plat['config_file'] = os.path.join(package_dir, 'config', plat['config_file'])
+    plat['gz_bridge_config'] = os.path.join(package_dir, 'config', plat['gz_bridge_config'])
+    plat['platform_id'] = platform
+    return package_dir, plat
+
+
+def _launch_setup(context, *args, **kwargs):
+    package_dir, plat = _resolve_platform(context)
+    robot_description = _load_robot_description(package_dir, plat['robot_urdf'])
+
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    log_level = LaunchConfiguration('log_level')
+    px4_namespace = LaunchConfiguration('px4_namespace')
+    world_frame = LaunchConfiguration('world_frame')
+    body_frame = LaunchConfiguration('body_frame')
+    publish_tf = LaunchConfiguration('publish_tf')
+
+    microxrce_agent_process = ExecuteProcess(
+        cmd=[
+            LaunchConfiguration('microxrce_agent'),
+            'udp4',
+            '-p', LaunchConfiguration('microxrce_port'),
+        ],
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_microxrce_agent')),
+    )
+
+    px4_sitl_process = ExecuteProcess(
+        cmd=[LaunchConfiguration('px4_binary')],
+        cwd=LaunchConfiguration('px4_dir'),
+        additional_env={
+            'PX4_SYS_AUTOSTART': LaunchConfiguration('px4_sys_autostart'),
+            'PX4_SIM_MODEL': plat['px4_sim_model'],
+            'PX4_GZ_WORLD': LaunchConfiguration('px4_gz_world'),
+            'PX4_GZ_MODEL_POSE': plat.get('px4_gz_model_pose', ''),
+        },
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('launch_px4_sitl')),
+    )
+
+    gz_bridge_node = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='ros_gz_bridge',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'config_file': plat['gz_bridge_config'],
+            'use_sim_time': use_sim_time,
+        }],
+        condition=IfCondition(LaunchConfiguration('launch_gz_bridge')),
+    )
+
+    lqr_controller_node = Node(
+        package='tvc_controller',
+        executable='lqr_px4_controller',
+        name='lqr_px4_controller',
+        output='screen',
+        parameters=[
+            plat['config_file'],
+            {'use_sim_time': use_sim_time},
+        ],
+        arguments=['--ros-args', '--log-level', log_level],
+        emulate_tty=True,
+        condition=IfCondition(LaunchConfiguration('launch_controller')),
+    )
+
+    default_gz_vision_config = os.path.join(package_dir, 'config', 'gz_vision.yaml')
+
+    px4_rviz_bridge_node = Node(
+        package='tvc_controller',
+        executable='px4_rviz_bridge',
+        name='px4_rviz_bridge',
+        output='screen',
+        emulate_tty=True,
+        parameters=[{
+            'px4_namespace': px4_namespace,
+            'world_frame': world_frame,
+            'body_frame': body_frame,
+            'publish_tf': publish_tf,
+            'gz_odometry_topic': plat['gz_odometry_topic'],
+            'use_sim_time': use_sim_time,
+        }],
+        condition=IfCondition(LaunchConfiguration('launch_px4_rviz_bridge')),
+    )
+
+    gz_vision_node = Node(
+        package='tvc_controller',
+        executable='gz_vision_publisher',
+        name='gz_vision_publisher',
+        output='screen',
+        emulate_tty=True,
+        parameters=[
+            default_gz_vision_config,
+            {
+                'px4_namespace': px4_namespace,
+                'gz_odometry_topic': plat['gz_odometry_topic'],
+                'use_sim_time': use_sim_time,
+            },
+        ],
+        condition=IfCondition(LaunchConfiguration('launch_gz_vision')),
+    )
+
+    rviz_node = Node(
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='screen',
+        arguments=['-d', LaunchConfiguration('rviz_config')],
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(LaunchConfiguration('launch_rviz')),
+    )
+
+    joint_state_adapter_node = Node(
+        package='tvc_controller',
+        executable='joint_state_adapter',
+        name='joint_state_adapter',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
+    )
+
+    robot_state_publisher_node = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{
+            'robot_description': robot_description,
+            'use_sim_time': use_sim_time,
+        }],
+        remappings=[('/joint_states', '/tvc/joint_states')],
+        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
+    )
+
+    gz_bridge_stack = TimerAction(
+        period=LaunchConfiguration('gz_bridge_delay'),
+        actions=[
+            gz_bridge_node,
+        ],
+    )
+
+    ros_stack = TimerAction(
+        period=LaunchConfiguration('ros_startup_delay'),
+        actions=[
+            gz_vision_node,
+            joint_state_adapter_node,
+            robot_state_publisher_node,
+            px4_rviz_bridge_node,
+            rviz_node,
+        ],
+    )
+
+    controller_stack = TimerAction(
+        period=LaunchConfiguration('controller_startup_delay'),
+        actions=[
+            lqr_controller_node,
+        ],
+    )
+
+    return [
+        microxrce_agent_process,
+        px4_sitl_process,
+        gz_bridge_stack,
+        ros_stack,
+        controller_stack,
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -54,15 +255,10 @@ def generate_launch_description() -> LaunchDescription:
     default_rviz_config = os.path.join(package_dir, 'config', 'px4_rviz.rviz')
     default_bridge_config = os.path.join(package_dir, 'config', 'bridge.yaml')
     default_px4_dir = _default_px4_dir(package_dir)
-    robot_description = _load_robot_description(package_dir)
     default_px4_binary = os.path.join(
         default_px4_dir, 'build', 'px4_sitl_default', 'bin', 'px4')
     default_microxrce_agent = _find_microxrce_agent()
 
-    # Fast DDS: allow history buffers to grow when PX4 message payloads vary
-    # (avoids RTPS_READER_HISTORY "cannot be resized" errors on /fmu/out/*).
-    # Search candidates in this order: installed share dir, src tree (so the
-    # profile still works when the user forgets to re-run `colcon build`).
     fastrtps_profile_candidates = [
         os.path.join(package_dir, 'fastrtps_profile.xml'),
         os.path.abspath(os.path.join(
@@ -79,12 +275,20 @@ def generate_launch_description() -> LaunchDescription:
         'FASTRTPS_DEFAULT_PROFILES_FILE',
         fastrtps_profile,
     )
-    # The XML profile is Fast DDS specific; force the rmw to fastrtps so the
-    # historyMemoryPolicy=DYNAMIC setting is actually honored.
     set_rmw_impl = SetEnvironmentVariable(
         'RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp',
     )
 
+    rocket_platform_arg = DeclareLaunchArgument(
+        'rocket_platform',
+        default_value='proxy',
+        description='Rocket platform: proxy (validation) or real (20 kg vehicle).',
+    )
+    robot_urdf_arg = DeclareLaunchArgument(
+        'robot_urdf',
+        default_value='tvc.urdf',
+        description='RViz / robot_state_publisher URDF file name under models/tvc/.',
+    )
     config_file_arg = DeclareLaunchArgument(
         'config_file',
         default_value=default_config_file,
@@ -142,7 +346,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     px4_sim_model_arg = DeclareLaunchArgument(
         'px4_sim_model', default_value='tvc',
-        description='PX4 Gazebo model name.',
+        description='PX4 Gazebo model name (overridden by rocket_platform unless set explicitly).',
     )
     px4_gz_world_arg = DeclareLaunchArgument(
         'px4_gz_world', default_value='default',
@@ -157,8 +361,12 @@ def generate_launch_description() -> LaunchDescription:
         description='UDP port for the MicroXRCE-DDS agent.',
     )
     ros_startup_delay_arg = DeclareLaunchArgument(
-        'ros_startup_delay', default_value='2.0',
-        description='Seconds to wait before visualization nodes (clock/vision start earlier).',
+        'ros_startup_delay', default_value='5.0',
+        description='Seconds before vision, RViz, and robot model nodes.',
+    )
+    controller_startup_delay_arg = DeclareLaunchArgument(
+        'controller_startup_delay', default_value='10.0',
+        description='Seconds before LQR controller (wait for PX4 model spawn + EKF).',
     )
     gz_bridge_delay_arg = DeclareLaunchArgument(
         'gz_bridge_delay', default_value='1.0',
@@ -173,8 +381,8 @@ def generate_launch_description() -> LaunchDescription:
         description='Start the MicroXRCE-DDS agent.',
     )
     launch_controller_arg = DeclareLaunchArgument(
-        'launch_controller', default_value='true',
-        description='Start the LQR PX4 controller node.',
+        'launch_controller', default_value='false',
+        description='Start the external LQR controller (default: use PX4 built-in control).',
     )
     launch_gz_bridge_arg = DeclareLaunchArgument(
         'launch_gz_bridge', default_value='true',
@@ -197,144 +405,11 @@ def generate_launch_description() -> LaunchDescription:
         description='Start robot_state_publisher for RViz RobotModel display.',
     )
 
-    use_sim_time = LaunchConfiguration('use_sim_time')
-
-    microxrce_agent_process = ExecuteProcess(
-        cmd=[
-            LaunchConfiguration('microxrce_agent'),
-            'udp4',
-            '-p', LaunchConfiguration('microxrce_port'),
-        ],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('launch_microxrce_agent')),
-    )
-
-    px4_sitl_process = ExecuteProcess(
-        cmd=[LaunchConfiguration('px4_binary')],
-        cwd=LaunchConfiguration('px4_dir'),
-        additional_env={
-            'PX4_SYS_AUTOSTART': LaunchConfiguration('px4_sys_autostart'),
-            'PX4_SIM_MODEL': LaunchConfiguration('px4_sim_model'),
-            'PX4_GZ_WORLD': LaunchConfiguration('px4_gz_world'),
-        },
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('launch_px4_sitl')),
-    )
-
-    gz_bridge_node = Node(
-        package='ros_gz_bridge',
-        executable='parameter_bridge',
-        name='ros_gz_bridge',
-        output='screen',
-        emulate_tty=True,
-        parameters=[{
-            'config_file': LaunchConfiguration('gz_bridge_config'),
-            'use_sim_time': use_sim_time,
-        }],
-        condition=IfCondition(LaunchConfiguration('launch_gz_bridge')),
-    )
-
-    lqr_controller_node = Node(
-        package=package_name,
-        executable='lqr_px4_controller',
-        name='lqr_px4_controller',
-        output='screen',
-        parameters=[
-            LaunchConfiguration('config_file'),
-            {'use_sim_time': use_sim_time},
-        ],
-        arguments=['--ros-args', '--log-level', LaunchConfiguration('log_level')],
-        emulate_tty=True,
-        condition=IfCondition(LaunchConfiguration('launch_controller')),
-    )
-
-    px4_rviz_bridge_node = Node(
-        package=package_name,
-        executable='px4_rviz_bridge',
-        name='px4_rviz_bridge',
-        output='screen',
-        emulate_tty=True,
-        parameters=[{
-            'px4_namespace': LaunchConfiguration('px4_namespace'),
-            'world_frame': LaunchConfiguration('world_frame'),
-            'body_frame': LaunchConfiguration('body_frame'),
-            'publish_tf': LaunchConfiguration('publish_tf'),
-            'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
-            'use_sim_time': use_sim_time,
-        }],
-        condition=IfCondition(LaunchConfiguration('launch_px4_rviz_bridge')),
-    )
-
-    gz_vision_node = Node(
-        package=package_name,
-        executable='gz_vision_publisher',
-        name='gz_vision_publisher',
-        output='screen',
-        emulate_tty=True,
-        parameters=[
-            default_gz_vision_config,
-            {
-                'px4_namespace': LaunchConfiguration('px4_namespace'),
-                'gz_odometry_topic': LaunchConfiguration('gz_odometry_topic'),
-                'use_sim_time': use_sim_time,
-            },
-        ],
-        condition=IfCondition(LaunchConfiguration('launch_gz_vision')),
-    )
-
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        output='screen',
-        arguments=['-d', LaunchConfiguration('rviz_config')],
-        parameters=[{'use_sim_time': use_sim_time}],
-        condition=IfCondition(LaunchConfiguration('launch_rviz')),
-    )
-
-    joint_state_adapter_node = Node(
-        package=package_name,
-        executable='joint_state_adapter',
-        name='joint_state_adapter',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time}],
-        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
-    )
-
-    robot_state_publisher_node = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='robot_state_publisher',
-        output='screen',
-        parameters=[{
-            'robot_description': robot_description,
-            'use_sim_time': use_sim_time,
-        }],
-        remappings=[('/joint_states', '/tvc/joint_states')],
-        condition=IfCondition(LaunchConfiguration('launch_robot_model')),
-    )
-
-    gz_bridge_stack = TimerAction(
-        period=LaunchConfiguration('gz_bridge_delay'),
-        actions=[
-            gz_bridge_node,
-            gz_vision_node,
-            joint_state_adapter_node,
-            robot_state_publisher_node,
-        ],
-    )
-
-    viz_stack = TimerAction(
-        period=LaunchConfiguration('ros_startup_delay'),
-        actions=[
-            px4_rviz_bridge_node,
-            rviz_node,
-        ],
-    )
-
     return LaunchDescription([
         set_fastrtps_profile,
         set_rmw_impl,
+        rocket_platform_arg,
+        robot_urdf_arg,
         config_file_arg,
         px4_namespace_arg,
         world_frame_arg,
@@ -353,6 +428,7 @@ def generate_launch_description() -> LaunchDescription:
         microxrce_agent_arg,
         microxrce_port_arg,
         ros_startup_delay_arg,
+        controller_startup_delay_arg,
         gz_bridge_delay_arg,
         launch_px4_sitl_arg,
         launch_microxrce_agent_arg,
@@ -362,8 +438,5 @@ def generate_launch_description() -> LaunchDescription:
         launch_gz_vision_arg,
         launch_rviz_arg,
         launch_robot_model_arg,
-        microxrce_agent_process,
-        px4_sitl_process,
-        gz_bridge_stack,
-        viz_stack,
+        OpaqueFunction(function=_launch_setup),
     ])
